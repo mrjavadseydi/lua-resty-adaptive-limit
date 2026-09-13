@@ -1,0 +1,180 @@
+-- Shared-dictionary state layer.
+--
+-- Owns every key the module reads or writes, all of them interned at
+-- construction time. The request path performs zero string construction:
+-- admission touches exactly K_limit and K_inflight.
+--
+-- Key layout (prefix = "al:<schema>:<name>:"):
+--   limit, inflight, long_rtt, short_rtt, gradient,
+--   last_window, last_update   — permanent controller state
+--   w:<n>:c|s|ovl|tmo|err|abt|rej — per-window aggregate accumulators;
+--       every writer uses atomic incr (init 0), so flushes from any
+--       number of workers are race-free by construction. Keys carry an
+--       exptime (set once per window per worker, on rollover) so an
+--       interrupted controller cannot leak window keys; the controller
+--       additionally deletes them after processing.
+--   lease:<n>                  — controller lease for window n (TTL only)
+--   hb:<worker_id>             — worker heartbeat (TTL only)
+--
+-- All methods return library-level results; raw dict error strings are
+-- propagated to the caller (limiter.lua classifies them).
+
+local WINDOW_FIELDS = { "c", "s", "ovl", "tmo", "err", "abt", "rej" }
+
+local _M = {}
+
+_M.SCHEMA_VERSION = 1
+
+function _M.new(dict, name)
+    if not dict then
+        return nil, "shared dict not found"
+    end
+    local prefix = "al:" .. _M.SCHEMA_VERSION .. ":" .. name .. ":"
+
+    local K = {
+        schema      = prefix .. "schema",
+        limit       = prefix .. "limit",
+        inflight    = prefix .. "inflight",
+        long_rtt    = prefix .. "long_rtt",
+        short_rtt   = prefix .. "short_rtt",
+        gradient    = prefix .. "gradient",
+        last_window = prefix .. "last_window",
+        last_update = prefix .. "last_update",
+    }
+
+    local state = {
+        dict = dict,
+        K = K,
+        prefix = prefix,
+        -- per-window key cache, rebuilt on window rollover by the
+        -- scheduler (control path); never touched by the request path
+        _win = { n = nil },
+    }
+
+    return setmetatable(state, { __index = _M })
+end
+
+-- Window accumulator key cache: control path only.
+function _M:window_keys(n)
+    local cache = self._win
+    if cache.n ~= n then
+        local p = self.prefix .. "w:" .. n .. ":"
+        cache.n = n
+        for i = 1, #WINDOW_FIELDS do
+            local f = WINDOW_FIELDS[i]
+            cache[f] = p .. f
+        end
+    end
+    return cache
+end
+
+-- Atomic add of a partial aggregate into window n. init 0 makes the
+-- first writer create the key; concurrent flushers serialize inside the
+-- shared dictionary. window_ttl is applied when this worker first touches
+-- the window's keys (rollover detection via the caller).
+function _M:add_window(n, field, delta, window_ttl)
+    local keys = self:window_keys(n)
+    local key = keys[field]
+    local value, err = self.dict:incr(key, delta, 0)
+    if not value then
+        return nil, err
+    end
+    if self._ttl_set ~= n then
+        -- once per window per worker: backstop expiry so window keys can
+        -- never outlive their usefulness even if no controller ever runs
+        self._ttl_set = n
+        for i = 1, #WINDOW_FIELDS do
+            self.dict:expire(keys[WINDOW_FIELDS[i]], window_ttl)
+        end
+    end
+    return value
+end
+
+-- Read all accumulators of window n; missing keys read as 0.
+-- (dict:get returns nil, "not found" for absent keys — that is a normal
+-- empty accumulator here, only genuine errors are propagated.)
+function _M:read_window(n)
+    local keys = self:window_keys(n)
+    local out = {}
+    local dict = self.dict
+    for i = 1, #WINDOW_FIELDS do
+        local f = WINDOW_FIELDS[i]
+        local v, err = dict:get(keys[f])
+        if v == nil and err and err ~= "not found" then
+            return nil, err
+        end
+        out[f] = v or 0
+    end
+    return out
+end
+
+function _M:delete_window(n)
+    local keys = self:window_keys(n)
+    for i = 1, #WINDOW_FIELDS do
+        self.dict:delete(keys[WINDOW_FIELDS[i]])
+    end
+end
+
+-- Controller lease: add wins; TTL-only expiry (the lease is never
+-- explicitly deleted — a successor lease for window n+1 must never be
+-- disturbed by our cleanup, and window n is never processed again
+-- anyway thanks to the last_window guard).
+function _M:try_lease(n, owner, ttl)
+    return self.dict:add(self.prefix .. "lease:" .. n, owner, ttl)
+end
+
+function _M:heartbeat(worker_id, now, ttl)
+    return self.dict:set(self.prefix .. "hb:" .. worker_id, now, ttl)
+end
+
+function _M:worker_alive(worker_id, now)
+    local v = self.dict:get(self.prefix .. "hb:" .. worker_id)
+    return v ~= nil, v
+end
+
+function _M:read_schema()
+    return self.dict:get(self.K.schema)
+end
+
+function _M:write_schema()
+    -- ttl 0 = never expires; add() so a concurrent first-worker race is
+    -- benign
+    return self.dict:add(self.K.schema, tostring(self.SCHEMA_VERSION))
+end
+
+-- Controller state read/write (control path only). Missing keys come
+-- back as nil fields; the return value is nil only on genuine dict
+-- errors.
+function _M:read_controller_state()
+    local dict = self.dict
+    local K = self.K
+    local cs = {}
+    local fields = { "limit", "long_rtt", "short_rtt", "last_window" }
+    local keys = { K.limit, K.long_rtt, K.short_rtt, K.last_window }
+    for i = 1, #fields do
+        local v, err = dict:get(keys[i])
+        if v == nil and err and err ~= "not found" then
+            return nil, err
+        end
+        cs[fields[i]] = v
+    end
+    return cs
+end
+
+function _M:publish_controller_state(limit, long_rtt, short_rtt, gradient,
+                                     last_window, now)
+    local dict = self.dict
+    local K = self.K
+    -- Order matters for crash-mid-publish safety: last_window is written
+    -- last, so a partial publish leaves last_window behind the published
+    -- limit and the window would simply be processed again (idempotent by
+    -- last_window) rather than skipped.
+    dict:set(K.limit, limit)
+    dict:set(K.long_rtt, long_rtt)
+    dict:set(K.short_rtt, short_rtt)
+    dict:set(K.gradient, gradient)
+    dict:set(K.last_update, now)
+    dict:set(K.last_window, last_window)
+end
+
+return _M

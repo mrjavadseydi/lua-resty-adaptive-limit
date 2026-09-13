@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         unzip \
         procps \
+        pkg-config \
+        libssl-dev \
         apache2-utils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -34,13 +36,21 @@ RUN cpanm --notest Test::Nginx
 # busted for pure-Lua unit tests and simulations.
 RUN luarocks install busted 2>&1 | tail -2
 
-# wrk for load generation (benchmarks + soak).
+# wrk for load generation (benchmarks + soak). Linked against OpenResty's
+# bundled LuaJIT — wrk's vendored LuaJIT/OpenSSL copies fail to build with
+# modern toolchains and take much longer anyway. wrk expects headers
+# directly under <prefix>/include, OpenResty ships them under
+# include/luajit-2.1/, so a symlinked prefix bridges the layouts.
 RUN git clone --depth=1 https://github.com/wg/wrk.git /tmp/wrk \
-    && make -C /tmp/wrk -j"$(nproc)" \
+    && mkdir -p /tmp/lj/include /tmp/lj/lib \
+    && ln -s /usr/local/openresty/luajit/include/luajit-2.1/* /tmp/lj/include/ \
+    && ln -s /usr/local/openresty/luajit/lib/* /tmp/lj/lib/ \
+    && make -C /tmp/wrk -j"$(nproc)" WITH_LUAJIT=/tmp/lj \
     && cp /tmp/wrk/wrk /usr/local/bin/wrk \
-    && rm -rf /tmp/wrk
+    && rm -rf /tmp/wrk /tmp/lj
 
 ENV PATH=/usr/local/openresty/luajit/bin:/usr/local/openresty/bin:/usr/local/openresty/nginx/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV LD_LIBRARY_PATH=/usr/local/openresty/luajit/lib
 ENV TEST_NGINX_BINARY=/usr/local/openresty/nginx/sbin/nginx
 ENV LUA_PATH=/work/lib/?.lua;/work/lib/?/init.lua;./?.lua;
 
