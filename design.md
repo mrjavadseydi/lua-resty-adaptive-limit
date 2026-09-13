@@ -153,10 +153,15 @@ outside its namespace. All key strings are interned Lua strings built once
 in `new()`; the request path performs no concatenation.
 
 Namespace prefix: `al:<schema_version>:<name>:` (currently `al:1:`).
+One dict-global schema marker, `adaptive_limit:schema`, lives *outside*
+the versioned namespaces: a future library version would otherwise write
+under `al:2:` while old workers kept `al:1:` and neither would ever
+detect the other (split-brain counters). With the marker, an
+incompatible shared state is a loud startup error.
 
 | Key | Type | Writer | Lifetime |
 |---|---|---|---|
-| `...:schema` | `"1"` | init_worker (first worker) | permanent |
+| `adaptive_limit:schema` | `"1"` | init_worker (first worker) | permanent |
 | `...:limit` | number (integer) | controller lease holder | permanent |
 | `...:inflight` | number | admission (incr), release (incr), exit_worker | permanent |
 | `...:long_rtt` / `...:short_rtt` / `...:gradient` | number | controller | permanent |

@@ -90,4 +90,15 @@ local function make_dict()
 end
 
 ngx.make_dict = make_dict
+
+-- Clear shared zones in place and rewind the clock. Zones must never be
+-- replaced wholesale: the library captures ngx.shared at module-load
+-- time, so only in-place mutation stays visible to it.
+function ngx.reset()
+    for k in pairs(ngx.shared) do
+        ngx.shared[k] = nil
+    end
+    ngx._now = 1000.0
+end
+
 return ngx

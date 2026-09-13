@@ -16,6 +16,7 @@
 
 local errors = require("resty.adaptive_limit.errors")
 local limiter_mod = require("resty.adaptive_limit.limiter")
+local state_mod = require("resty.adaptive_limit.state")
 local runtime = require("resty.adaptive_limit.runtime")
 
 local ngx_get_phase = ngx.get_phase
@@ -65,7 +66,8 @@ function _M.start(opts)
             if err == errors.INVALID_STATE then
                 runtime.started = false
                 return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
-                    "\": " .. err
+                    "\": incompatible shared state schema (expected version " ..
+                    tostring(state_mod.SCHEMA_VERSION) .. ")"
             end
             return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
                 "\": schema check failed: " .. tostring(err)

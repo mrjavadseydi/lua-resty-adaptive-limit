@@ -231,6 +231,16 @@ function _M:try_acquire()
         dict:set(self.K_limit, limit)
         rate_limited_log(self, "limit_missing", ngx_WARN,
             "limit key missing; re-seeded from last observed value")
+    elseif type(limit) ~= "number" or limit ~= limit or limit < 0 then
+        -- Corrupted shared value: never trust it and never crash the
+        -- request comparing against it (spec §31/§46). Replace with the
+        -- last observed limit and surface.
+        self.anomalies.limit_corrupted =
+            (self.anomalies.limit_corrupted or 0) + 1
+        limit = self._last_limit or self.cfg.initial_limit
+        dict:set(self.K_limit, limit)
+        rate_limited_log(self, "limit_corrupted", ngx_ERR,
+            "limit key corrupted (non-numeric/negative); re-seeded")
     end
     self._last_limit = limit
 
@@ -304,15 +314,17 @@ function _M:release(latency, outcome)
     end
 
     -- 2. Record the observation (never blocks the release: fixed-size
-    --    struct updates only).
+    --    struct updates only). sample_count counts usable latency
+    --    observations; outcome counters count every completed outcome.
     if outcome ~= "ignored" then
         local s = self.stats
-        local latency_n = sanitize_latency(self, latency)
         if outcome ~= "aborted" then
             -- Client aborts release the slot but their (truncated)
-            -- duration is not a capacity signal.
-            s.sample_count = s.sample_count + 1
+            -- duration is not a capacity signal; malformed latency is
+            -- dropped by sanitize_latency so mean_rtt stays honest.
+            local latency_n = sanitize_latency(self, latency)
             if latency_n then
+                s.sample_count = s.sample_count + 1
                 s.latency_sum = s.latency_sum + latency_n
             end
         end

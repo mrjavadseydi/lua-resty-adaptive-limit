@@ -25,6 +25,14 @@ local _M = {}
 
 _M.SCHEMA_VERSION = 1
 
+-- The schema marker lives OUTSIDE the versioned per-limiter namespace:
+-- if it sat at "al:<version>:..." an upgraded library would simply use a
+-- different prefix and old/new workers would split-brain into two
+-- independent counters inside the same zone without ever detecting each
+-- other. One dict-global marker makes an incompatible shared state a
+-- loud startup error instead.
+_M.SCHEMA_KEY = "adaptive_limit:schema"
+
 function _M.new(dict, name)
     if not dict then
         return nil, "shared dict not found"
@@ -32,7 +40,6 @@ function _M.new(dict, name)
     local prefix = "al:" .. _M.SCHEMA_VERSION .. ":" .. name .. ":"
 
     local K = {
-        schema      = prefix .. "schema",
         limit       = prefix .. "limit",
         inflight    = prefix .. "inflight",
         long_rtt    = prefix .. "long_rtt",
@@ -133,13 +140,12 @@ function _M:worker_alive(worker_id, now)
 end
 
 function _M:read_schema()
-    return self.dict:get(self.K.schema)
+    return self.dict:get(self.SCHEMA_KEY)
 end
 
 function _M:write_schema()
-    -- ttl 0 = never expires; add() so a concurrent first-worker race is
-    -- benign
-    return self.dict:add(self.K.schema, tostring(self.SCHEMA_VERSION))
+    -- no TTL; add() so a concurrent first-worker race is benign
+    return self.dict:add(self.SCHEMA_KEY, tostring(self.SCHEMA_VERSION))
 end
 
 -- Controller state read/write (control path only). Missing keys come
