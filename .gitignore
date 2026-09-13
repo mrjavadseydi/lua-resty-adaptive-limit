@@ -1,0 +1,22 @@
+# Test::Nginx scratch state
+t/servroot*/
+t/servroot
+t/*.out
+
+# LuaRocks / busted local artifacts
+.luarocks/
+luarocks-*.tree
+.busted
+*.luacov.output*
+
+# Benchmark scratch
+benchmark/results/*.raw
+benchmark/tmp/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+
+# ZCode workspace state
+.zcode/
