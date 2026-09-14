@@ -167,9 +167,8 @@ incompatible shared state is a loud startup error.
 | `...:long_rtt` / `...:short_rtt` / `...:gradient` | number | controller | permanent |
 | `...:last_window` | number | controller | permanent |
 | `...:last_update` | number | controller | permanent |
-| `...:w:<n>:c` | number | worker flush (atomic incr) | exptime + explicit delete |
-| `...:w:<n>:s` | number | worker flush (atomic incr) | exptime + explicit delete |
-| `...:w:<n>:ovl` / `:tmo` / `:err` / `:abt` / `:rej` | number | worker flush (atomic incr) | exptime + explicit delete |
+| `...:w:<n>:c` / `:s` | number | worker flush (atomic incr) | exptime + explicit delete |
+| `...:w:<n>:ovl` / `:tmo` / `:cer` / `:err` / `:abt` / `:rej` | number | worker flush (atomic incr) | exptime + explicit delete |
 | `...:lease:<n>` | string `"<pid>:<seq>"` | lease contender (add) | TTL (`lease_ttl`) |
 | `...:hb:<worker_id>` | number (timestamp) | scheduler heartbeat | TTL 5s |
 
@@ -299,10 +298,12 @@ Given window measurement `m` and current state:
 
 1. If `m.sample_count < min_samples` → hold (no update at all).
 2. `short_rtt' = sample_alpha * m.mean_rtt + (1 - sample_alpha) * short_rtt`
-3. Baseline update is **frozen during overload episodes**: if
-   `(overload + timeout + error) / sample_count > overload.failure_ratio`,
-   `long_rtt` is not updated this window (an overload must not be normalized
-   into the baseline). Otherwise
+3. Baseline update is **frozen during overload episodes**: if the
+   strong-signal ratio `(overload + timeout + connect_error) /
+   sample_count > overload.failure_ratio`, `long_rtt` is not updated
+   this window (an overload must not be normalized into the baseline;
+   application errors such as HTTP 500 are *not* strong signals and do
+   not freeze it). Otherwise
    `long_rtt' = baseline_alpha * short_rtt' + (1 - baseline_alpha) * long_rtt`.
 4. `gradient = clamp(rtt_tolerance * long_rtt' / short_rtt', min_gradient, 1.0)`
    (guard: `short_rtt' <= 0` → hold).

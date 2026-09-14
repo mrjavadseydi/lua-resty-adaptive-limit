@@ -197,6 +197,13 @@ function _M.build(user)
     err = positive_num(cfg.sample_window, "sample_window")
     if err then return nil, err end
 
+    cfg.aggregation_grace = opt("aggregation_grace", 0.35)
+    if type(cfg.aggregation_grace) ~= "number"
+        or cfg.aggregation_grace ~= cfg.aggregation_grace
+        or cfg.aggregation_grace < 0 then
+        return nil, fail("aggregation_grace must be a non-negative number")
+    end
+
     cfg.min_samples = opt("min_samples", 20)
     err = integer_in_range(cfg.min_samples, "min_samples", 1, 2 ^ 31)
     if err then return nil, err end

@@ -39,7 +39,8 @@ function _M.update(state, m, cfg)
         short_rtt = ewma(state.short_rtt, mean, cfg.sample_alpha)
     end
 
-    local failure_count = m.overload_count + m.timeout_count + m.error_count
+    local failure_count = m.overload_count + m.timeout_count
+        + m.connect_error_count
     local congested = failure_count / sc > cfg.overload_failure_ratio
 
     local long_rtt = state.long_rtt

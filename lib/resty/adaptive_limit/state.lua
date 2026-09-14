@@ -19,7 +19,7 @@
 -- All methods return library-level results; raw dict error strings are
 -- propagated to the caller (limiter.lua classifies them).
 
-local WINDOW_FIELDS = { "c", "s", "ovl", "tmo", "err", "abt", "rej" }
+local WINDOW_FIELDS = { "c", "s", "ovl", "tmo", "cer", "err", "abt", "rej" }
 
 local _M = {}
 

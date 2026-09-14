@@ -68,13 +68,14 @@ function _M.validate_measurement(m, cfg)
 
     local ovl = m.overload_count or 0
     local tmo = m.timeout_count or 0
+    local cer = m.connect_error_count or 0
     local err = m.error_count or 0
     local abt = m.aborted_count or 0
-    if not is_count(ovl) or not is_count(tmo)
+    if not is_count(ovl) or not is_count(tmo) or not is_count(cer)
         or not is_count(err) or not is_count(abt) then
         return nil, "invalid outcome counts"
     end
-    if ovl + tmo + err + abt > sc then
+    if ovl + tmo + cer + err + abt > sc then
         return nil, "outcome counts exceed sample_count"
     end
 
@@ -83,6 +84,7 @@ function _M.validate_measurement(m, cfg)
         mean_rtt = mean,
         overload_count = ovl,
         timeout_count = tmo,
+        connect_error_count = cer,
         error_count = err,
         aborted_count = abt,
     }

@@ -28,6 +28,27 @@ local ngx_ERR = ngx.ERR
 local ngx_WARN = ngx.WARN
 local ngx_shared = ngx.shared
 
+local floor = math.floor
+
+-- Stats fields flushed into shared window accumulators, and their
+-- accumulator names. All flushed fields are monotonic: flush() writes
+-- deltas (current - flushed-marker) so a request racing the flush can
+-- only leave its increment for the next tick, never lose it.
+local FLUSH_FIELDS = {
+    "sample_count", "latency_sum", "overload", "timeout",
+    "connect_error", "error", "aborted", "rejected_total",
+}
+local FIELD_TO_WINDOW = {
+    sample_count  = "c",
+    latency_sum   = "s",
+    overload      = "ovl",
+    timeout       = "tmo",
+    connect_error = "cer",
+    error         = "err",
+    aborted       = "abt",
+    rejected_total = "rej",
+}
+
 -- Outcomes accepted by release(). "ignored" excludes the sample from
 -- controller statistics entirely (health checks, synthetic probes).
 local OUTCOMES = {
@@ -139,6 +160,13 @@ function _M.new(user_cfg)
 
         -- flush bookkeeping (scheduler)
         _flush_window = nil,
+        -- flushed-marker mirror of the monotonic stats fields: flush()
+        -- writes deltas against these into the shared window
+        -- accumulators and advances them by exactly the written delta
+        _flushed = {
+            sample_count = 0, latency_sum = 0, overload = 0, timeout = 0,
+            connect_error = 0, error = 0, aborted = 0, rejected_total = 0,
+        },
     }
 
     runtime.registry[cfg.name] = limiter
@@ -348,6 +376,45 @@ function _M:release(latency, outcome)
     end
 
     return true
+end
+
+------------------------------------------------------------------------
+-- Statistics flush (control path — called by the scheduler only)
+------------------------------------------------------------------------
+
+--- Flush this worker's stats deltas into the shared accumulator of the
+-- window that covers `now`. Non-yielding; safe inside timer callbacks.
+-- Returns the window id the flush targeted.
+-- The whole body contains no yield point, so a light thread can never
+-- interleave mid-flush; the delta/flushed-marker pattern additionally
+-- keeps the math exact even if a future dict op were to yield.
+function _M:flush(now)
+    local cfg = self.cfg
+    local win = floor(now / cfg.sample_window)
+    local s = self.stats
+    local flushed = self._flushed
+    local ttl = cfg.sample_window + cfg.aggregation_grace + 15
+
+    for i = 1, #FLUSH_FIELDS do
+        local f = FLUSH_FIELDS[i]
+        local delta = s[f] - flushed[f]
+        if delta ~= 0 then
+            local ok, err = self.st:add_window(win, FIELD_TO_WINDOW[f],
+                delta, ttl)
+            if not ok then
+                -- do not advance the marker: the delta is retried on
+                -- the next tick; surface the dict failure
+                self.internal_errors = self.internal_errors + 1
+                rate_limited_log(self, "flush", ngx_ERR,
+                    "window flush failed: ", err or "unknown")
+                return win
+            end
+            flushed[f] = flushed[f] + delta
+        end
+    end
+
+    self._flush_window = win
+    return win
 end
 
 ------------------------------------------------------------------------
