@@ -17,8 +17,11 @@
 local errors = require("resty.adaptive_limit.errors")
 local config_mod = require("resty.adaptive_limit.config")
 local state_mod = require("resty.adaptive_limit.state")
+local upstream_time = require("resty.adaptive_limit.upstream_time")
+local http_mod = require("resty.adaptive_limit.http")
 local runtime = require("resty.adaptive_limit.runtime")
 
+local ngx = ngx
 local ngx_now = ngx.now
 local ngx_log = ngx.log
 local ngx_ERR = ngx.ERR
@@ -347,9 +350,167 @@ function _M:release(latency, outcome)
     return true
 end
 
+------------------------------------------------------------------------
+-- Request lifecycle helpers (access / log)
+------------------------------------------------------------------------
+--
+-- ngx.ctx values stored under the limiter's precomputed key:
+--   1 = admitted by this limiter (a slot is held)
+--   2 = released (log() already ran: idempotence latch)
+--   3 = no slot held (explicit bypass, or fail-open admission after a
+--       limiter-internal error): log() releases and records nothing
+--
+-- Within one location's phase chain (and across error_page redirects,
+-- where ngx.ctx survives), the ctx flag makes access() a no-op for a
+-- limiter that already admitted this request: one request holds at most
+-- one slot per limiter. ngx.exec targets and subrequests are guarded
+-- separately (see access() below) because ngx.exec resets ngx.ctx and
+-- subrequests never get a log phase.
+
+-- Default outcome classifier (design.md §10). 499 is a client abort, not
+-- a capacity signal; 502/503/504 from the protected upstream are strong
+-- overload signals; other 5xx are application errors, counted but not
+-- treated as overload.
+local STATUS_OUTCOMES = {
+    [499] = "aborted",
+    [502] = "connect_error",
+    [503] = "overload",
+    [504] = "timeout",
+}
+
+local function default_observation(self)
+    local status = ngx.status
+    -- 499 is a client abort, not a capacity signal; 502/503/504 from the
+    -- protected upstream are strong overload signals; other 5xx are
+    -- application errors, counted but not treated as overload
+    local outcome = STATUS_OUTCOMES[status]
+        or (status >= 500 and "error" or "success")
+
+    local classifier = self.cfg.outcome_classifier
+    if classifier then
+        -- user code: never allowed to break the release
+        local ok, custom = pcall(classifier, status)
+        if ok and custom and OUTCOMES[custom] then
+            outcome = custom
+        elseif not ok then
+            count_anomaly(self, "classifier_error")
+            rate_limited_log(self, "classifier", ngx_ERR,
+                "outcome_classifier failed: ", tostring(custom))
+        end
+    end
+
+    if outcome == "aborted" or outcome == "ignored" then
+        return nil, outcome
+    end
+
+    local source = self.cfg.latency_source
+    if source == "manual" then
+        return nil, outcome
+    end
+    if source == "upstream_response_time" then
+        return upstream_time.parse(ngx.var.upstream_response_time,
+            self.cfg.upstream_time_choice), outcome
+    end
+    -- "request_time": full request duration; trade-offs in README
+    return ngx_now() - ngx.req.start_time(), outcome
+end
+
+--- Request-lifecycle admission. Call from access_by_lua*.
+-- opts.bypass: admit nothing, track nothing (health checks, streams).
+-- Returns true, or nil + errors.REJECTED (caller chooses the response)
+-- or a limiter-internal error (masked to `true` under fail_open).
+function _M:access(opts)
+    local ctx = ngx.ctx
+    if type(opts) == "table" and opts.bypass then
+        if ctx[self._ctx_key] == nil then
+            ctx[self._ctx_key] = 3
+        end
+        return true
+    end
+
+    if ctx[self._ctx_key] ~= nil then
+        -- admitted, released, or bypassed earlier in this request
+        -- (internal redirect): never acquire a second slot
+        return true
+    end
+
+    -- Internal re-entries (subrequests, error_page targets, ngx.exec
+    -- targets) share the parent request's admission by default: the log
+    -- phase never runs for subrequests and runs only once (for the final
+    -- location) in exec chains, so acquiring here too would leak a slot
+    -- per re-entry. All of this is verified empirically (see t/lifecycle.t
+    -- TEST 6/6b): ngx.ctx survives error_page redirects but is reset by
+    -- ngx.exec, subrequests get no log phase, and $request_id changes at
+    -- every redirect — so there is no stable cross-ctx request identity.
+    --
+    -- allow_internal = true re-enables admission for internal requests,
+    -- for limiters protecting locations that are ONLY reached through
+    -- ngx.exec / X-Accel-Redirect (whose log phase runs there). Under
+    -- that mode, subrequests into the location would acquire without a
+    -- matching log phase and leak — do not capture such locations.
+    if not self.cfg.allow_internal and ngx.req.is_internal() then
+        ctx[self._ctx_key] = 3
+        return true
+    end
+
+    local ok, err = self:try_acquire()
+    if ok then
+        ctx[self._ctx_key] = 1
+        return true
+    end
+
+    if err == errors.NOT_STARTED or err == errors.INVALID_STATE then
+        -- configuration-level problems: fail_open masks genuine limiter
+        -- failures, not a misconfigured deployment
+        return nil, err
+    end
+
+    if err ~= errors.REJECTED and self.cfg.failure_mode == "fail_open" then
+        ctx[self._ctx_key] = 3
+        return true
+    end
+    return nil, err
+end
+
+--- Request-lifecycle release. Call from log_by_lua*.
+-- Idempotent; releases only what access() admitted; accounting happens
+-- before any observation work; observability failures never block the
+-- release (invariant 10). Yields nothing.
+function _M:log()
+    local ctx = ngx.ctx
+    local state = ctx[self._ctx_key]
+    if state == nil then
+        -- nothing acquired through the lifecycle API (low-level usage or
+        -- a request that never reached access())
+        return true
+    end
+    if state == 2 then
+        -- double log(): no-op, counters untouched
+        return true
+    end
+
+    if state == 3 then
+        ctx[self._ctx_key] = 2
+        return true
+    end
+
+    -- admitted: compute the observation (cheap, non-yielding), then
+    -- release() performs the accounting first and the recording second
+    local latency, outcome = default_observation(self)
+    ctx[self._ctx_key] = 2
+    return self:release(latency, outcome)
+end
+
+--- Convenience rejection response (optional, outside the core).
+-- "rejected" -> configured status + Retry-After; internal errors -> 500.
+function _M:enforce(err)
+    return http_mod.reject(self.cfg, err)
+end
+
 -- Exposed for tests and the scheduler.
 _M.rate_limited_log = rate_limited_log
 _M.count_anomaly = count_anomaly
+_M.default_observation = default_observation
 _M.OUTCOMES = OUTCOMES
 
 return _M

@@ -16,6 +16,8 @@ if not (ngx and ngx.__is_test_stub) then
     local stub = {
         __is_test_stub = true,
         _now = 1000.0,
+        _start_time = 999.98, -- ngx.req.start_time()
+        status = 200,
         WARN = ngx and ngx.WARN or 4,
         ERR = ngx and ngx.ERR or 5,
     }
@@ -28,6 +30,21 @@ if not (ngx and ngx.__is_test_stub) then
 
     stub.get_phase = function()
         return "init_worker"
+    end
+
+    stub.req = {
+        start_time = function()
+            return stub._start_time
+        end,
+        is_internal = function()
+            return stub._internal or false
+        end,
+    }
+
+    stub.var = {}
+
+    stub.exit = function(status)
+        stub._last_exit = status
     end
 
     stub.shared = {}
@@ -99,6 +116,14 @@ function ngx.reset()
         ngx.shared[k] = nil
     end
     ngx._now = 1000.0
+    ngx._start_time = 999.98
+    ngx._internal = false
+    ngx.status = 200
+    ngx._last_exit = nil
+    ngx.ctx = {}
+    ngx.var = {}
+    ngx.header = {}
 end
 
+ngx.reset()
 return ngx

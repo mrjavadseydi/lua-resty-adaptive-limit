@@ -134,6 +134,7 @@ function _M.build(user)
         rejection_status = user.rejection_status or 503,
         retry_after = user.retry_after or 1,
         stale_threshold = opt("stale_threshold", 30),
+        allow_internal = user.allow_internal or false,
         on_update = user.on_update,
         on_anomaly = user.on_anomaly,
         outcome_classifier = user.outcome_classifier,
@@ -157,6 +158,9 @@ function _M.build(user)
 
     if type(cfg.stale_threshold) ~= "number" or cfg.stale_threshold <= 0 then
         return nil, fail("stale_threshold must be a positive number")
+    end
+    if type(cfg.allow_internal) ~= "boolean" then
+        return nil, fail("allow_internal must be a boolean")
     end
     if cfg.on_update ~= nil and type(cfg.on_update) ~= "function" then
         return nil, fail("on_update must be a function")
