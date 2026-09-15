@@ -21,6 +21,8 @@
 
 local WINDOW_FIELDS = { "c", "s", "ovl", "tmo", "cer", "err", "abt", "rej" }
 
+local floor = math.floor
+
 local _M = {}
 
 _M.SCHEMA_VERSION = 1
@@ -40,7 +42,8 @@ function _M.new(dict, name)
     local prefix = "al:" .. _M.SCHEMA_VERSION .. ":" .. name .. ":"
 
     local K = {
-        limit       = prefix .. "limit",
+        limit       = prefix .. "limit",       -- published integer limit
+        limit_f     = prefix .. "limit_f",     -- controller float state
         inflight    = prefix .. "inflight",
         long_rtt    = prefix .. "long_rtt",
         short_rtt   = prefix .. "short_rtt",
@@ -155,8 +158,10 @@ function _M:read_controller_state()
     local dict = self.dict
     local K = self.K
     local cs = {}
-    local fields = { "limit", "long_rtt", "short_rtt", "last_window" }
-    local keys = { K.limit, K.long_rtt, K.short_rtt, K.last_window }
+    local fields = { "limit", "limit_f", "long_rtt", "short_rtt",
+        "last_window" }
+    local keys = { K.limit, K.limit_f, K.long_rtt, K.short_rtt,
+        K.last_window }
     for i = 1, #fields do
         local v, err = dict:get(keys[i])
         if v == nil and err and err ~= "not found" then
@@ -167,18 +172,27 @@ function _M:read_controller_state()
     return cs
 end
 
-function _M:publish_controller_state(limit, long_rtt, short_rtt, gradient,
+function _M:publish_controller_state(limit_f, long_rtt, short_rtt, gradient,
                                      last_window, now)
     local dict = self.dict
     local K = self.K
-    -- Order matters for crash-mid-publish safety: last_window is written
-    -- last, so a partial publish leaves last_window behind the published
-    -- limit and the window would simply be processed again (idempotent by
-    -- last_window) rather than skipped.
-    dict:set(K.limit, limit)
-    dict:set(K.long_rtt, long_rtt)
-    dict:set(K.short_rtt, short_rtt)
-    dict:set(K.gradient, gradient)
+    -- The published integer limit follows the float state; last_window is
+    -- written LAST. If the worker dies mid-publish, last_window lags and
+    -- the window is simply processed again — at worst one extra smoothing
+    -- step on values that are clamped and finite either way. (Writing
+    -- last_window first instead would skip the window; both failure
+    -- orders are bounded, the repeated-update order keeps more signal.)
+    dict:set(K.limit_f, limit_f)
+    dict:set(K.limit, math.floor(limit_f))
+    if long_rtt ~= nil then
+        dict:set(K.long_rtt, long_rtt)
+    end
+    if short_rtt ~= nil then
+        dict:set(K.short_rtt, short_rtt)
+    end
+    if gradient ~= nil then
+        dict:set(K.gradient, gradient)
+    end
     dict:set(K.last_update, now)
     dict:set(K.last_window, last_window)
 end

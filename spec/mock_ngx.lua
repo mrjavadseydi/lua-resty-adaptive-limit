@@ -47,6 +47,22 @@ if not (ngx and ngx.__is_test_stub) then
         stub._last_exit = status
     end
 
+    -- timer.every captures the callback instead of arming a real timer;
+    -- specs can drive ticks deterministically via ngx.fire_tick()
+    stub.timer = {
+        every = function(interval, cb)
+            stub._tick_interval = interval
+            stub._tick_cb = cb
+            return true
+        end,
+    }
+
+    function stub.fire_tick()
+        if stub._tick_cb then
+            stub._tick_cb(false)
+        end
+    end
+
     stub.shared = {}
     ngx = stub
 end
@@ -120,6 +136,7 @@ function ngx.reset()
     ngx._internal = false
     ngx.status = 200
     ngx._last_exit = nil
+    ngx._tick_cb = nil
     ngx.ctx = {}
     ngx.var = {}
     ngx.header = {}

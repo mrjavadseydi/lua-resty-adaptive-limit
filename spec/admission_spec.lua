@@ -194,8 +194,9 @@ describe("admission", function()
 
     it("preserves a learned limit across a simulated reload", function()
         local limiter, dict = fresh_env()
-        -- simulate a controller-published limit
+        -- simulate controller-published state (float + integer)
         dict._data["al:1:payments:limit"] = 7
+        dict._data["al:1:payments:limit_f"] = 7.35
         -- fresh worker VM: reset registries, keep the dict
         runtime.started = false
         runtime.registry = {}
@@ -204,7 +205,7 @@ describe("admission", function()
             shared_dict = "adaptive_limit", initial_limit = 10,
             min_limit = 1, max_limit = 10 }))
         assert(adaptive.start())
-        assert.are.equal(7, limiter2._last_limit)
+        assert.True(math.abs(limiter2._last_limit - 7.35) < 1e-9)
         -- and the schema marker was not recreated
         assert.are.equal("1", dict._data["adaptive_limit:schema"])
     end)

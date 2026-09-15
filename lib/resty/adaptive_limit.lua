@@ -17,6 +17,7 @@
 local errors = require("resty.adaptive_limit.errors")
 local limiter_mod = require("resty.adaptive_limit.limiter")
 local state_mod = require("resty.adaptive_limit.state")
+local scheduler = require("resty.adaptive_limit.scheduler")
 local runtime = require("resty.adaptive_limit.runtime")
 
 local ngx_get_phase = ngx.get_phase
@@ -76,24 +77,13 @@ function _M.start(opts)
     end
 
     runtime.started = true
-
-    -- The scheduler itself (timer creation, tick loop, controller
-    -- wiring) is installed here by the phases that follow; admission
-    -- already works once `started` is set.
-    if runtime.start_scheduler then
-        return runtime.start_scheduler()
-    end
-
-    return true
+    return scheduler.start()
 end
 
 --- Stop the per-worker scheduler (testing and controlled shutdown).
 function _M.stop()
     runtime.started = false
-    if runtime.stop_scheduler then
-        return runtime.stop_scheduler()
-    end
-    return true
+    return scheduler.stop()
 end
 
 --- Names of the limiters registered in this worker.

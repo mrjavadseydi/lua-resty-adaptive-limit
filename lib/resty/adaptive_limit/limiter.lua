@@ -184,6 +184,7 @@ function _M:reseed_shared_state()
     -- A fresh limiter starts at initial_limit. A restart with existing
     -- state adopts it (checked by the caller before calling this).
     self.st.dict:set(self.K_limit, cfg.initial_limit)
+    self.st.dict:set(st.K.limit_f, cfg.initial_limit)
     self.st.dict:set(st.K.inflight, 0)
     self.st.dict:set(st.K.last_window, 0)
     self.st.dict:set(st.K.last_update, ngx_now())
@@ -224,14 +225,15 @@ function _M:adopt_shared_state()
         -- state is unknown, not absent
         return nil, errors.INTERNAL_ERROR
     end
-    if cs.limit == nil or type(cs.limit) ~= "number"
-        or cs.limit ~= cs.limit then
+    -- prefer the float controller state; fall back to the integer limit
+    local adopted = cs.limit_f or cs.limit
+    if adopted == nil or type(adopted) ~= "number" or adopted ~= adopted then
         -- absent or corrupt: fall back to a reseed
         self:reseed_shared_state()
         return self.cfg.initial_limit
     end
-    self._last_limit = cs.limit
-    return cs.limit
+    self._last_limit = adopted
+    return adopted
 end
 
 ------------------------------------------------------------------------
@@ -572,6 +574,157 @@ end
 -- "rejected" -> configured status + Retry-After; internal errors -> 500.
 function _M:enforce(err)
     return http_mod.reject(self.cfg, err)
+end
+
+------------------------------------------------------------------------
+-- Controller wiring (control path — called by the scheduler only)
+------------------------------------------------------------------------
+
+local LEASE_TTL = 5      -- seconds; per-window lease outlives any tick
+local HB_TTL = 5         -- seconds; worker heartbeat key lifetime
+-- At most this many closed windows are processed in one tick; older
+-- backlog (timer pause, SIGSTOP, laptop sleep) is skipped and counted.
+local MAX_WINDOWS_PER_TICK = 2
+
+local common_ctrl = require("resty.adaptive_limit.controller.common")
+
+--- One scheduler tick for this limiter: heartbeat, stats flush,
+-- controller work. Non-yielding throughout.
+function _M:tick(now, worker_id)
+    -- heartbeat first: liveness stays visible even if the rest fails
+    self.st:heartbeat(worker_id, now, HB_TTL)
+    self:flush(now)
+    self:control(now)
+end
+
+--- Run controller updates for every closed window past the grace period
+-- that this limiter has not processed yet.
+function _M:control(now)
+    local cfg = self.cfg
+    local sw = cfg.sample_window
+    local st = self.st
+
+    local cs, err = st:read_controller_state()
+    if not cs then
+        self.internal_errors = self.internal_errors + 1
+        rate_limited_log(self, "control", ngx_ERR,
+            "controller state read failed: ", err or "unknown")
+        return
+    end
+
+    local last = cs.last_window or 0
+    local n_ready = floor((now - cfg.aggregation_grace) / sw) - 1
+    if n_ready <= last then
+        return
+    end
+
+    -- stale backlog: never replay old windows after a long pause
+    local from = last + 1
+    if n_ready - from + 1 > MAX_WINDOWS_PER_TICK then
+        local skipped = n_ready - MAX_WINDOWS_PER_TICK - last
+        self.controller_skips = (self.controller_skips or 0) + skipped
+        rate_limited_log(self, "stale", ngx_WARN,
+            "skipping ", tostring(skipped),
+            " stale controller windows after a pause")
+        from = n_ready - MAX_WINDOWS_PER_TICK + 1
+    end
+
+    for n = from, n_ready do
+        if not self:control_window(n, now) then
+            break -- lease lost or dict failure: stop for this tick
+        end
+    end
+end
+
+--- Process exactly one closed window. Returns false when the caller
+-- should stop (lease lost, dict failure); true otherwise (including
+-- "held: insufficient samples").
+function _M:control_window(n, now)
+    local cfg = self.cfg
+    local st = self.st
+    local dict = st.dict
+
+    -- Controller lease: add wins. TTL-only expiry — we never delete a
+    -- lease, so a successor lease for a later window is never disturbed,
+    -- and last_window makes re-processing impossible anyway.
+    local ok = st:try_lease(n,
+        tostring(ngx.worker and ngx.worker.pid() or 0) .. ":" .. tostring(n),
+        LEASE_TTL)
+    if not ok then
+        self.controller_skips = (self.controller_skips or 0) + 1
+        return false
+    end
+
+    local acc, aerr = st:read_window(n)
+    if not acc then
+        self.internal_errors = self.internal_errors + 1
+        rate_limited_log(self, "control", ngx_ERR,
+            "window read failed: ", aerr or "unknown")
+        return false
+    end
+
+    local cs, err = st:read_controller_state()
+    if not cs then
+        self.internal_errors = self.internal_errors + 1
+        rate_limited_log(self, "control", ngx_ERR,
+            "controller state read failed: ", err or "unknown")
+        return false
+    end
+
+    local measurement = {
+        sample_count = acc.c,
+        mean_rtt = acc.c > 0 and acc.s / acc.c or 0,
+        overload_count = acc.ovl,
+        timeout_count = acc.tmo,
+        connect_error_count = acc.cer,
+        error_count = acc.err,
+        aborted_count = acc.abt,
+    }
+
+    local state = {
+        limit = cs.limit_f or cs.limit or cfg.initial_limit,
+        long_rtt = cs.long_rtt,
+        short_rtt = cs.short_rtt,
+    }
+
+    local next_state, uerr = common_ctrl.safe_update(self.algorithm,
+        state, measurement, cfg)
+    local held = false
+    if not next_state then
+        -- invalid input or invalid algorithm output: hold the previous
+        -- valid state; never publish anything unvalidated (invariant 9)
+        held = true
+        self.controller_skips = (self.controller_skips or 0) + 1
+        self.internal_errors = self.internal_errors + 1
+        rate_limited_log(self, "controller", ngx_ERR,
+            "controller update rejected, holding limit: ", uerr or "?")
+        next_state = state
+    elseif next_state.held then
+        held = true
+        self.controller_skips = (self.controller_skips or 0) + 1
+    else
+        self.controller_updates = (self.controller_updates or 0) + 1
+    end
+
+    st:publish_controller_state(next_state.limit, next_state.long_rtt,
+        next_state.short_rtt, next_state.gradient, n, now)
+    self._last_limit = math.floor(next_state.limit)
+    st:delete_window(n)
+
+    if cfg.on_update then
+        pcall(cfg.on_update, {
+            name = cfg.name,
+            window = n,
+            limit = self._last_limit,
+            float_limit = next_state.limit,
+            long_rtt = next_state.long_rtt,
+            short_rtt = next_state.short_rtt,
+            gradient = next_state.gradient,
+            samples = measurement.sample_count,
+            held = held,
+        })
+    end
+    return true
 end
 
 -- Exposed for tests and the scheduler.
