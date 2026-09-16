@@ -86,6 +86,17 @@ function _M.stop()
     return scheduler.stop()
 end
 
+--- Reconcile worker-local state into the shared counter. Call once from
+-- exit_worker_by_lua* (see README): slots this worker still holds are
+-- subtracted so a graceful shutdown or reload drain cannot leak them.
+function _M.exit()
+    local order = runtime.order
+    for i = 1, #order do
+        order[i]:exit_worker()
+    end
+    return true
+end
+
 --- Names of the limiters registered in this worker.
 function _M.limiters()
     local order = runtime.order

@@ -727,6 +727,42 @@ function _M:control_window(n, now)
     return true
 end
 
+------------------------------------------------------------------------
+-- Worker exit reconciliation (control path — exit_worker_by_lua only)
+------------------------------------------------------------------------
+
+--- Reconcile this worker's still-held slots into the shared counter.
+-- Call via adaptive.exit() from exit_worker_by_lua*. During graceful
+-- shutdown the requests held here are torn down and will never reach
+-- log_by_lua, so their slots would leak forever without this. If a
+-- straggler log phase still fires afterwards, its release floors the
+-- shared counter at 0 and raises the negative-inflight anomaly —
+-- visible, never corrupting. Abrupt death (SIGKILL) runs nothing at
+-- all: that leak is a documented limitation, surfaced through heartbeat
+-- expiry and the stuck diagnostics in state().
+function _M:exit_worker()
+    local held = self._inflight
+    if held <= 0 then
+        return true
+    end
+    local dict = self.st.dict
+    local n = dict:incr(self.K_inflight, -held)
+    if not n then
+        self.internal_errors = self.internal_errors + 1
+        return nil, errors.INTERNAL_ERROR
+    end
+    if n < 0 then
+        dict:set(self.K_inflight, 0)
+    end
+    self._inflight = 0
+    self.anomalies.exit_with_inflight =
+        (self.anomalies.exit_with_inflight or 0) + held
+    rate_limited_log(self, "exit", ngx_WARN,
+        "worker exited holding ", tostring(held),
+        " slots; reconciled shared counter")
+    return true
+end
+
 -- Exposed for tests and the scheduler.
 _M.rate_limited_log = rate_limited_log
 _M.count_anomaly = count_anomaly
