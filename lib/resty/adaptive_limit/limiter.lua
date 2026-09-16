@@ -597,6 +597,12 @@ function _M:tick(now, worker_id)
     self:control(now)
 end
 
+--- Initial heartbeat, written synchronously in adaptive.start() so a
+-- worker is visible in state() before its first scheduler tick.
+function _M:heartbeat(worker_id)
+    self.st:heartbeat(worker_id, ngx_now(), HB_TTL)
+end
+
 --- Run controller updates for every closed window past the grace period
 -- that this limiter has not processed yet.
 function _M:control(now)
@@ -711,7 +717,9 @@ function _M:control_window(n, now)
     self._last_limit = math.floor(next_state.limit)
     st:delete_window(n)
 
-    if cfg.on_update then
+    -- The hook contract is "after each controller publication": held
+    -- windows advance bookkeeping only and fire nothing.
+    if cfg.on_update and not held then
         pcall(cfg.on_update, {
             name = cfg.name,
             window = n,
@@ -721,7 +729,7 @@ function _M:control_window(n, now)
             short_rtt = next_state.short_rtt,
             gradient = next_state.gradient,
             samples = measurement.sample_count,
-            held = held,
+            held = false,
         })
     end
     return true
@@ -761,6 +769,110 @@ function _M:exit_worker()
         "worker exited holding ", tostring(held),
         " slots; reconciled shared counter")
     return true
+end
+
+------------------------------------------------------------------------
+-- Observability (NOT on the request hot path)
+------------------------------------------------------------------------
+
+--- Observability snapshot. Performs several shared-dict reads and a
+-- fixed number of heartbeat probes; never call per request. Numeric
+-- counters under `stats`, `anomalies` and the flat counters are
+-- worker-local (since this worker's start); shared state (`limit`,
+-- `inflight`, RTTs, window bookkeeping) is cluster-wide for this
+-- nginx instance. No JSON is produced anywhere.
+function _M:state()
+    local st = self.st
+    local dict = st.dict
+    local K = st.K
+    local cfg = self.cfg
+    local now = ngx_now()
+    local s = self.stats
+
+    local function getnum(key)
+        local v, err = dict:get(key)
+        if v == nil and err and err ~= "not found" then
+            return nil
+        end
+        return v
+    end
+
+    local limit = getnum(K.limit)
+    local inflight = getnum(K.inflight)
+    local since_completion = s.last_completion and (now - s.last_completion)
+
+    -- Stuck diagnostics (spec §26): the pool is exhausted and this
+    -- worker has seen no completions for stale_threshold seconds. A
+    -- completion-based controller cannot observe a fully hung backend;
+    -- backpressure still holds, and this flag makes it visible. Note
+    -- `last_completion` is this worker's view (worker-local).
+    local stalled = inflight ~= nil and limit ~= nil
+        and inflight >= limit
+        and (since_completion == nil
+             or since_completion > cfg.stale_threshold)
+
+    -- worker liveness: heartbeat slots are indexed by worker id
+    local expected = ngx.worker.count() or 1
+    local active = 0
+    for i = 0, expected - 1 do
+        if st:worker_alive(i) then
+            active = active + 1
+        end
+    end
+
+    -- last closed window's raw accumulators (shared view)
+    local win = floor(now / cfg.sample_window) - 1
+    local acc = st:read_window(win)
+
+    local capacity_ok, capacity = pcall(dict.capacity, dict)
+    if not capacity_ok then capacity = nil end
+    local free_ok, free = pcall(dict.free_space, dict)
+    if not free_ok then free = nil end
+
+    local anomalies = 0
+    for _, v in pairs(self.anomalies) do
+        anomalies = anomalies + v
+    end
+
+    return {
+        name = cfg.name,
+        algorithm = cfg.algorithm,
+
+        limit = limit,
+        float_limit = getnum(K.limit_f),
+        inflight = inflight,
+        local_inflight = self._inflight,
+
+        short_rtt = getnum(K.short_rtt),
+        long_rtt = getnum(K.long_rtt),
+        gradient = getnum(K.gradient),
+
+        window = floor(now / cfg.sample_window),
+        last_window = getnum(K.last_window),
+        last_update = getnum(K.last_update),
+        last_sample_count = acc and acc.c or nil,
+        last_overload_count = acc and (acc.ovl + acc.tmo + acc.cer) or nil,
+        last_rejected = acc and acc.rej or nil,
+
+        admitted_total = s.admitted_total,
+        rejected_total = s.rejected_total,
+        sample_count = s.sample_count,
+
+        controller_updates = self.controller_updates or 0,
+        controller_skips = self.controller_skips or 0,
+        internal_errors = self.internal_errors,
+        counter_anomalies = anomalies,
+        anomalies = self.anomalies,
+        timer_failures = self.timer_failures or 0,
+
+        last_completion_age = since_completion,
+        controller_stalled = stalled,
+        workers_active = active,
+        workers_expected = expected,
+
+        shared_dict_capacity = capacity,
+        shared_dict_free = free,
+    }
 end
 
 -- Exposed for tests and the scheduler.

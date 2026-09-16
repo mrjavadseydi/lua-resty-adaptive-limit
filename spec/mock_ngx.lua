@@ -47,6 +47,18 @@ if not (ngx and ngx.__is_test_stub) then
         stub._last_exit = status
     end
 
+    stub.worker = {
+        id = function()
+            return stub._worker_id or 0
+        end,
+        count = function()
+            return stub._worker_count or 1
+        end,
+        pid = function()
+            return 4242
+        end,
+    }
+
     -- timer.every captures the callback instead of arming a real timer;
     -- specs can drive ticks deterministically via ngx.fire_tick()
     stub.timer = {
@@ -134,6 +146,8 @@ function ngx.reset()
     ngx._now = 1000.0
     ngx._start_time = 999.98
     ngx._internal = false
+    ngx._worker_id = 0
+    ngx._worker_count = 1
     ngx.status = 200
     ngx._last_exit = nil
     ngx._tick_cb = nil

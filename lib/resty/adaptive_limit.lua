@@ -74,6 +74,9 @@ function _M.start(opts)
                 "\": schema check failed: " .. tostring(err)
         end
         limiter:adopt_shared_state()
+        -- first heartbeat before the scheduler's first tick, so worker
+        -- liveness is correct from the moment start() returns
+        limiter:heartbeat(ngx.worker.id())
     end
 
     runtime.started = true
