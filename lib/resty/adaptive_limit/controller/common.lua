@@ -46,8 +46,13 @@ function _M.validate_state(state, cfg)
 end
 
 -- Validate a window measurement, returning a normalized measurement or
--- nil + reason. Corruption detection includes class counts exceeding the
--- sample count (impossible without shared-state corruption).
+-- nil + reason. Corruption detection bounds the outcome-class counts and
+-- the sample count by the number of completed (non-ignored) outcomes —
+-- never by the sample count itself: aborted outcomes and unusable
+-- latencies are completions but not samples, so a legitimate abort-heavy
+-- window has class counts exceeding sample_count. The wiring always
+-- supplies completions; direct callers (algorithm specs) may omit it,
+-- in which case the sum checks are skipped.
 function _M.validate_measurement(m, cfg)
     if type(m) ~= "table" then
         return nil, "measurement must be a table"
@@ -75,8 +80,18 @@ function _M.validate_measurement(m, cfg)
         or not is_count(err) or not is_count(abt) then
         return nil, "invalid outcome counts"
     end
-    if ovl + tmo + cer + err + abt > sc then
-        return nil, "outcome counts exceed sample_count"
+
+    local cmp = m.completions
+    if cmp ~= nil then
+        if not is_count(cmp) then
+            return nil, "invalid completions"
+        end
+        if sc > cmp then
+            return nil, "sample_count exceeds completions"
+        end
+        if ovl + tmo + cer + err + abt > cmp then
+            return nil, "outcome counts exceed completions"
+        end
     end
 
     return {
@@ -87,7 +102,47 @@ function _M.validate_measurement(m, cfg)
         connect_error_count = cer,
         error_count = err,
         aborted_count = abt,
+        completions = cmp,
     }
+end
+
+-- Repair a state table that failed validate_state (or wraps a limit whose
+-- policy shrank across a reload) into one validate_state accepts: clamp
+-- limit into [min_limit, max_limit] (falling back to cfg.initial_limit
+-- when non-numeric/non-finite), and drop long_rtt/short_rtt when invalid
+-- rather than inventing a value. Returns the repaired state and whether
+-- anything was actually changed.
+function _M.repair_state(state, cfg)
+    local repaired = false
+
+    local limit = state.limit
+    if type(limit) ~= "number" or not _M.is_finite(limit) then
+        limit = cfg.initial_limit
+        repaired = true
+    elseif limit < cfg.min_limit then
+        limit = cfg.min_limit
+        repaired = true
+    elseif limit > cfg.max_limit then
+        limit = cfg.max_limit
+        repaired = true
+    end
+
+    local long_rtt = state.long_rtt
+    if long_rtt ~= nil and (type(long_rtt) ~= "number"
+        or not _M.is_finite(long_rtt) or long_rtt < 0) then
+        long_rtt = nil
+        repaired = true
+    end
+
+    local short_rtt = state.short_rtt
+    if short_rtt ~= nil and (type(short_rtt) ~= "number"
+        or not _M.is_finite(short_rtt) or short_rtt < 0) then
+        short_rtt = nil
+        repaired = true
+    end
+
+    return { limit = limit, long_rtt = long_rtt, short_rtt = short_rtt },
+        repaired
 end
 
 -- safe_update(algorithm, state, measurement, cfg) -> next_state | nil, err

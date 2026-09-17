@@ -106,6 +106,8 @@ describe("stats flush", function()
         assert.are.equal(1, d[win_key(100, "abt")])
         assert.are.equal(1, d[win_key(100, "err")])
         assert.are.equal(1, d[win_key(100, "rej")])
+        -- both releases are completions; the rejection is not
+        assert.are.equal(2, d[win_key(100, "cmp")])
     end)
 end)
 

@@ -1,4 +1,4 @@
-# Admission invariants against a stable limit (spec §51), single worker.
+# Admission invariants against a stable limit (design.md §1), single worker.
 #
 # The light-thread bursts exercise the full admission/release machinery
 # under cooperative interleaving with thousands of repetitions. True

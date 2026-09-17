@@ -76,10 +76,33 @@ describe("controller.common validation", function()
             { sample_count = 10, error_count = -1 }, cfg))
     end)
 
-    it("rejects class counts exceeding sample_count (corruption)", function()
+    it("accepts abort-heavy windows (completions > sample_count)", function()
+        -- 40 sampled successes + 60 aborted (never sampled): legitimate
+        local m = assert(common.validate_measurement(
+            { sample_count = 40, mean_rtt = 0.01, aborted_count = 60,
+              completions = 100 }, cfg))
+        assert.are.equal(60, m.aborted_count)
+        assert.are.equal(100, m.completions)
+    end)
+
+    it("rejects class counts exceeding completions (corruption)", function()
         assert.falsy(common.validate_measurement(
-            { sample_count = 10, overload_count = 11 }, cfg))
+            { sample_count = 10, overload_count = 11,
+              completions = 10 }, cfg))
         assert.falsy(common.validate_measurement(
+            { sample_count = 10, overload_count = 6, timeout_count = 6,
+              completions = 11 }, cfg))
+        -- sample_count is bounded by completions too
+        assert.falsy(common.validate_measurement(
+            { sample_count = 10, completions = 5 }, cfg))
+        -- completions itself must be a count
+        assert.falsy(common.validate_measurement(
+            { sample_count = 10, completions = 1.5 }, cfg))
+    end)
+
+    it("skips the sum checks when completions is absent", function()
+        -- direct controller callers (algorithm specs) may omit it
+        assert.truthy(common.validate_measurement(
             { sample_count = 10, overload_count = 6, timeout_count = 6 }, cfg))
     end)
 

@@ -36,7 +36,7 @@ local floor = math.floor
 -- only leave its increment for the next tick, never lose it.
 local FLUSH_FIELDS = {
     "sample_count", "latency_sum", "overload", "timeout",
-    "connect_error", "error", "aborted", "rejected_total",
+    "connect_error", "error", "aborted", "rejected_total", "completions",
 }
 local FIELD_TO_WINDOW = {
     sample_count  = "c",
@@ -47,6 +47,7 @@ local FIELD_TO_WINDOW = {
     error         = "err",
     aborted       = "abt",
     rejected_total = "rej",
+    completions   = "cmp",
 }
 
 -- Outcomes accepted by release(). "ignored" excludes the sample from
@@ -56,13 +57,13 @@ local OUTCOMES = {
     error = 1, aborted = 1, ignored = 1,
 }
 
--- Sanity clamp for externally supplied latency values (spec §31: a
+-- Sanity clamp for externally supplied latency values (design.md §10: a
 -- malformed latency must not corrupt the stats). Values outside
 -- [0, LATENCY_CAP] are counted as anomalies and not sampled.
 local LATENCY_CAP = 3600
 
 -- Rate-limited logging: at most one message per kind per LOG_INTERVAL
--- seconds per worker (spec §11: surface violations, never spam).
+-- seconds per worker (surface violations, never spam).
 local LOG_INTERVAL = 1.0
 
 local _M = {}
@@ -147,6 +148,7 @@ function _M.new(user_cfg)
             overload = 0,
             error = 0,
             aborted = 0,
+            completions = 0,
             admitted_total = 0,
             rejected_total = 0,
             last_completion = nil,
@@ -167,6 +169,7 @@ function _M.new(user_cfg)
         _flushed = {
             sample_count = 0, latency_sum = 0, overload = 0, timeout = 0,
             connect_error = 0, error = 0, aborted = 0, rejected_total = 0,
+            completions = 0,
         },
     }
 
@@ -247,8 +250,22 @@ function _M:adopt_shared_state()
         self:reseed_shared_state()
         return self.cfg.initial_limit
     end
-    self._last_limit = adopted
-    return adopted
+    local clamped = adopted
+    if adopted < self.cfg.min_limit then
+        clamped = self.cfg.min_limit
+    elseif adopted > self.cfg.max_limit then
+        clamped = self.cfg.max_limit
+    end
+    if clamped ~= adopted then
+        -- Out-of-policy adopted state (e.g. max_limit lowered across a
+        -- reload): publish the clamp immediately so admission is bounded
+        -- from the first request, not just from the next controller
+        -- window.
+        st.dict:set(self.K_limit, floor(clamped))
+        st.dict:set(st.K.limit_f, clamped)
+    end
+    self._last_limit = clamped
+    return clamped
 end
 
 ------------------------------------------------------------------------
@@ -281,7 +298,7 @@ function _M:try_acquire()
             "limit key missing; re-seeded from last observed value")
     elseif type(limit) ~= "number" or limit ~= limit or limit < 0 then
         -- Corrupted shared value: never trust it and never crash the
-        -- request comparing against it (spec §31/§46). Replace with the
+        -- request comparing against it. Replace with the
         -- last observed limit and surface.
         self.anomalies.limit_corrupted =
             (self.anomalies.limit_corrupted or 0) + 1
@@ -305,7 +322,13 @@ function _M:try_acquire()
     end
 
     -- Over the limit: roll the reservation back unconditionally.
-    dict:incr(self.K_inflight, -1)
+    local _, rerr = dict:incr(self.K_inflight, -1)
+    if rerr then
+        self.internal_errors = self.internal_errors + 1
+        count_anomaly(self, "rollback_failed")
+        rate_limited_log(self, "rollback", ngx_ERR,
+            "rollback incr failed: ", rerr)
+    end
     self.stats.rejected_total = self.stats.rejected_total + 1
     return nil, errors.REJECTED
 end
@@ -363,9 +386,14 @@ function _M:release(latency, outcome)
 
     -- 2. Record the observation (never blocks the release: fixed-size
     --    struct updates only). sample_count counts usable latency
-    --    observations; outcome counters count every completed outcome.
+    --    observations; outcome counters count every completed outcome;
+    --    completions counts every non-ignored outcome (the denominator
+    --    the controller's corruption check validates against — aborted
+    --    outcomes and unusable latencies are completions but never
+    --    samples).
     if outcome ~= "ignored" then
         local s = self.stats
+        s.completions = s.completions + 1
         if outcome ~= "aborted" then
             -- Client aborts release the slot but their (truncated)
             -- duration is not a capacity signal; malformed latency is
@@ -444,12 +472,15 @@ end
 --   3 = no slot held (explicit bypass, or fail-open admission after a
 --       limiter-internal error): log() releases and records nothing
 --
--- Within one location's phase chain (and across error_page redirects,
--- where ngx.ctx survives), the ctx flag makes access() a no-op for a
--- limiter that already admitted this request: one request holds at most
--- one slot per limiter. ngx.exec targets and subrequests are guarded
--- separately (see access() below) because ngx.exec resets ngx.ctx and
--- subrequests never get a log phase.
+-- Within one location's phase chain, the ctx flag makes access() a no-op
+-- for a limiter that already admitted this request: one request holds at
+-- most one slot per limiter. ngx.ctx does NOT survive an internal
+-- redirect (ngx.exec or error_page): both reset it, so a redirected
+-- request re-enters access() with a clean ctx. Subrequests and internal
+-- redirects are guarded separately (see access() below) because
+-- subrequests never get a log phase and a redirected request would
+-- otherwise acquire a second slot with no matching release in the
+-- original location.
 
 -- Default outcome classifier (design.md §10). 499 is a client abort, not
 -- a capacity signal; 502/503/504 from the protected upstream are strong
@@ -523,8 +554,8 @@ function _M:access(opts)
     -- phase never runs for subrequests and runs only once (for the final
     -- location) in exec chains, so acquiring here too would leak a slot
     -- per re-entry. All of this is verified empirically (see t/lifecycle.t
-    -- TEST 6/6b): ngx.ctx survives error_page redirects but is reset by
-    -- ngx.exec, subrequests get no log phase, and $request_id changes at
+    -- TEST 6/6b/10): ngx.ctx is reset by internal redirects (ngx.exec and
+    -- error_page), subrequests get no log phase, and $request_id changes at
     -- every redirect — so there is no stable cross-ctx request identity.
     --
     -- allow_internal = true re-enables admission for internal requests,
@@ -607,7 +638,9 @@ local common_ctrl = require("resty.adaptive_limit.controller.common")
 -- controller work. Non-yielding throughout.
 function _M:tick(now, worker_id)
     -- heartbeat first: liveness stays visible even if the rest fails
-    self.st:heartbeat(worker_id, now, HB_TTL)
+    if worker_id ~= nil then
+        self.st:heartbeat(worker_id, now, HB_TTL)
+    end
     self:flush(now)
     self:control(now)
 end
@@ -615,7 +648,9 @@ end
 --- Initial heartbeat, written synchronously in adaptive.start() so a
 -- worker is visible in state() before its first scheduler tick.
 function _M:heartbeat(worker_id)
-    self.st:heartbeat(worker_id, ngx_now(), HB_TTL)
+    if worker_id ~= nil then
+        self.st:heartbeat(worker_id, ngx_now(), HB_TTL)
+    end
 end
 
 --- Run controller updates for every closed window past the grace period
@@ -706,6 +741,7 @@ function _M:control_window(n, now)
         connect_error_count = acc.cer,
         error_count = acc.err,
         aborted_count = acc.abt,
+        completions = acc.cmp,
     }
 
     local state = {
@@ -725,7 +761,22 @@ function _M:control_window(n, now)
         self.internal_errors = self.internal_errors + 1
         rate_limited_log(self, "controller", ngx_ERR,
             "controller update rejected, holding limit: ", uerr or "?")
-        next_state = state
+
+        -- Repair state before publishing so out-of-policy limits or corrupt
+        -- RTT values do not permanently wedge the controller across reloads
+        local repaired_state, repaired = common_ctrl.repair_state(state, cfg)
+        if repaired then
+            rate_limited_log(self, "controller", ngx_WARN,
+                "repaired invalid shared controller state during hold: limit=",
+                tostring(repaired_state.limit))
+        end
+
+        next_state = {
+            limit = repaired_state.limit,
+            long_rtt = repaired_state.long_rtt,
+            short_rtt = repaired_state.short_rtt,
+            gradient = nil,
+        }
     elseif next_state.held then
         held = true
         self.controller_skips = (self.controller_skips or 0) + 1
@@ -822,7 +873,7 @@ function _M:state()
     local inflight = getnum(K.inflight)
     local since_completion = s.last_completion and (now - s.last_completion)
 
-    -- Stuck diagnostics (spec §26): the pool is exhausted and this
+    -- Stuck diagnostics (design.md §9): the pool is exhausted and this
     -- worker has seen no completions for stale_threshold seconds. A
     -- completion-based controller cannot observe a fully hung backend;
     -- backpressure still holds, and this flag makes it visible. Note

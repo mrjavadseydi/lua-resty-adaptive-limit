@@ -73,9 +73,8 @@ lua_shared_dict adaptive_limit 1m;
 init_worker_by_lua_block {
     local adaptive = require("resty.adaptive_limit")
     PAY = assert(adaptive.new({ name = "pay", shared_dict = "adaptive_limit",
-        initial_limit = 10, min_limit = 1, max_limit = 10,
-        flush_interval = 0.1 }))
-    assert(adaptive.start())
+        initial_limit = 10, min_limit = 1, max_limit = 10 }))
+    assert(adaptive.start({ flush_interval = 0.1 }))
 }
 --- config
 location /hb {

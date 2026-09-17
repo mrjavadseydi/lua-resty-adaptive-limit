@@ -107,6 +107,11 @@ object is ever allocated per rejection.
   admission for limiters that live on exec-fronted locations. A request
   is admitted at most once per limiter unless the caller clears the ctx
   flag deliberately.
+- **The location that admits must run the log phase**: in `error_page` internal
+  redirects, nginx resets `ngx.ctx` and executes only the fallback location's log
+  phase. To avoid leaking the admitted slot, the fallback location must explicitly
+  call `limiter:release(nil, outcome)` or the error must be handled in the admitting
+  location without redirect.
 - `access({ bypass = true })` skips admission entirely (health checks,
   streaming endpoints documented in §12).
 
@@ -125,7 +130,6 @@ with a descriptive error — never silently accepted.
 | `min_limit` | number | 1 | `>= 1` |
 | `max_limit` | number | 2000 | `>= min_limit` |
 | `sample_window` | number | 1.0 | controller window seconds; `> 0` |
-| `flush_interval` | number | 0.2 | worker flush / scheduler tick seconds; `> 0` |
 | `aggregation_grace` | number | 0.35 | seconds after window close before it is processed |
 | `min_samples` | number | 20 | below this many completions in a window: hold limit |
 | `failure_mode` | string | `"fail_open"` | or `"fail_closed"`, see §9 |
@@ -366,7 +370,7 @@ operations, executed by at most one worker, once per `sample_window`.
   worker's `local_inflight` into the shared counter (subtract-only, floored
   at 0, anomaly counted if non-zero). The exact ordering of `exit_worker`
   versus late `log_by_lua` calls was verified empirically (see
-  `t/reload.t`); reconciliation is coded to be safe under both orderings.
+  `t/resilience.t` and `benchmark/resilience.sh`); reconciliation is coded to be safe under both orderings.
 - **Abrupt death (SIGKILL / segfault)**: nothing runs; the victim's slots
   leak — the shared counter stays high, permanently reducing effective
   capacity until an operator acts. This is stated honestly rather than
@@ -386,9 +390,15 @@ operations, executed by at most one worker, once per `sample_window`.
 The shared dictionary survives HUP. New workers validate the schema marker
 and adopt the learned `limit`/RTT state — a healthy limit is never
 deliberately discarded by a reload. Old workers drain and reconcile via
-`exit_worker`. `t/reload.t` hammers this with continuous traffic: no
+`exit_worker`. `t/resilience.t` and `benchmark/resilience.sh` hammer this with continuous traffic: no
 permanent lockout, no negative counters, no runaway admission, no schema
 corruption.
+
+**Reload-overlap note:** during a graceful reload where code changes the
+measurement schema (such as the addition of `completions`), draining old
+workers do not write the new field. A mixed transition window may fail invariant
+validation and hold the previous limit once (failing safe); subsequent windows
+self-heal immediately as old workers finish draining.
 
 ## 10. Latency and outcome classification
 
@@ -468,8 +478,8 @@ corruption.
 | §53 scenarios A–H | deterministic simulations (`spec/simulation_spec.lua`) |
 | Admission races, multi-worker caps | Test::Nginx `t/admission.t`, `t/multi_worker.t` (1/2/4 workers, 100 concurrent vs limit 10, thousands of reps) |
 | Lifecycle (§52 list) | `t/lifecycle.t` |
-| Reload under traffic | `t/reload.t` (HUP × N while wrk drives requests) |
-| Worker SIGKILL | `t/worker_kill.t` |
+| Reload under traffic | `t/resilience.t`, `benchmark/resilience.sh` (HUP × N while wrk drives requests) |
+| Worker SIGKILL | `benchmark/resilience.sh` |
 | Controller integration (windows, lease, backoff) | `t/controller.t` |
 | Bounded memory / no leaks | `benchmark/soak.sh` + `t/stats.t` assertions |
 | Overhead vs baseline | `benchmark/run.sh` (baseline vs fixed-counter vs adaptive; 1/2/4/8 workers) |

@@ -1,4 +1,4 @@
-# Configuration validation (spec §30) and error semantics (spec §32).
+# Configuration validation (design.md §3) and error semantics (design.md §11).
 # Invalid configuration must be rejected immediately with clear errors;
 # nothing nonsensical may reach the controller.
 use Test::Nginx::Socket 'no_plan';

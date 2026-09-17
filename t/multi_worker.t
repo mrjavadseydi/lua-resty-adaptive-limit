@@ -1,4 +1,4 @@
-# Multi-worker shared-state correctness (spec §51).
+# Multi-worker shared-state correctness (design.md §1).
 #
 # A holder coroutine on one worker grabs every slot and holds them while a
 # real HTTP request arrives — whatever worker it lands on, admission must

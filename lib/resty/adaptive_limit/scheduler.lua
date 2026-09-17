@@ -1,7 +1,7 @@
 -- Per-worker scheduler: exactly one ngx.timer.every per worker serves
 -- every registered limiter (heartbeat + stats flush + controller work).
 --
--- Timer rules (spec §17): the callback is fully pcall-wrapped per
+-- Timer rules (design.md §8): the callback is fully pcall-wrapped per
 -- limiter so one limiter's failure cannot kill the tick for the others;
 -- ngx.timer.every re-arms itself (no recursive timer creation); on
 -- worker shutdown nginx passes premature=true and the timer dies with
@@ -14,6 +14,7 @@ local ngx_ERR = ngx.ERR
 
 local _M = {
     running = false,
+    timer_created = false,
 }
 
 local function tick(premature)
@@ -41,19 +42,29 @@ function _M.start()
     if _M.running then
         return true
     end
+    if _M.timer_created then
+        _M.running = true
+        return true
+    end
     local ok, err = ngx.timer.every(runtime.flush_interval, tick)
     if not ok then
         return nil, "adaptive_limit scheduler: " .. tostring(err)
     end
+    _M.timer_created = true
     _M.running = true
     return true
 end
 
--- ngx.timer.every timers cannot be cancelled; stop() only unblocks a
--- later start() (tests) and mirrors the shutdown latch.
+-- ngx.timer.every timers cannot be cancelled; stop() only pauses ticks,
+-- and mirrors the shutdown latch.
 function _M.stop()
     _M.running = false
     return true
+end
+
+function _M.reset()
+    _M.running = false
+    _M.timer_created = false
 end
 
 return _M

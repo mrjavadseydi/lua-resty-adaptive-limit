@@ -63,6 +63,7 @@ if not (ngx and ngx.__is_test_stub) then
     -- specs can drive ticks deterministically via ngx.fire_tick()
     stub.timer = {
         every = function(interval, cb)
+            stub._timer_calls = (stub._timer_calls or 0) + 1
             stub._tick_interval = interval
             stub._tick_cb = cb
             return true
@@ -151,6 +152,7 @@ function ngx.reset()
     ngx.status = 200
     ngx._last_exit = nil
     ngx._tick_cb = nil
+    ngx._timer_calls = 0
     ngx.ctx = {}
     ngx.var = {}
     ngx.header = {}

@@ -73,14 +73,27 @@ function _M.start(opts)
             return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
                 "\": schema check failed: " .. tostring(err)
         end
-        limiter:adopt_shared_state()
+        local adopted, aerr = limiter:adopt_shared_state()
+        if not adopted and aerr then
+            runtime.started = false
+            return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
+                "\": adopt shared state failed: " .. tostring(aerr)
+        end
         -- first heartbeat before the scheduler's first tick, so worker
         -- liveness is correct from the moment start() returns
-        limiter:heartbeat(ngx.worker.id())
+        local wid = ngx.worker.id()
+        if wid ~= nil then
+            limiter:heartbeat(wid)
+        end
     end
 
+    local sok, serr = scheduler.start()
+    if not sok then
+        runtime.started = false
+        return nil, serr
+    end
     runtime.started = true
-    return scheduler.start()
+    return true
 end
 
 --- Stop the per-worker scheduler (testing and controlled shutdown).

@@ -1,4 +1,4 @@
--- Parser for compound NGINX upstream timing values (spec §15/§41).
+-- Parser for compound NGINX upstream timing values (design.md §10).
 -- Calling tonumber() on "0.005, 0.010" silently produces nil or garbage;
 -- this parser is explicit about every token.
 

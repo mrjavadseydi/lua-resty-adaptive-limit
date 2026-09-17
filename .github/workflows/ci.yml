@@ -41,7 +41,7 @@ jobs:
     # The documented floor is OpenResty 1.15.8.1 (lua-nginx-module
     # 0.10.15 introduced exit_worker_by_lua*). Verified via a direct
     # smoke test under amd64 emulation; full Test::Nginx on the oldest
-    # image is impractibly slow under QEMU on arm64 hosts.
+    # image is impractically slow under QEMU on arm64 hosts.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

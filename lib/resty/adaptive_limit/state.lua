@@ -7,7 +7,7 @@
 -- Key layout (prefix = "al:<schema>:<name>:"):
 --   limit, inflight, long_rtt, short_rtt, gradient,
 --   last_window, last_update   — permanent controller state
---   w:<n>:c|s|ovl|tmo|err|abt|rej — per-window aggregate accumulators;
+--   w:<n>:c|s|ovl|tmo|err|abt|rej|cmp — per-window aggregate accumulators;
 --       every writer uses atomic incr (init 0), so flushes from any
 --       number of workers are race-free by construction. Keys carry an
 --       exptime (set once per window per worker, on rollover) so an
@@ -19,7 +19,8 @@
 -- All methods return library-level results; raw dict error strings are
 -- propagated to the caller (limiter.lua classifies them).
 
-local WINDOW_FIELDS = { "c", "s", "ovl", "tmo", "cer", "err", "abt", "rej" }
+local WINDOW_FIELDS = { "c", "s", "ovl", "tmo", "cer", "err", "abt", "rej",
+    "cmp" }
 
 local floor = math.floor
 

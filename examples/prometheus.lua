@@ -3,7 +3,7 @@
 --
 --   luarocks install nginx-lua-prometheus
 --
--- Metric names follow spec §35. Labels: the limiter name only — no
+-- Metric names follow design.md §13. Labels: the limiter name only — no
 -- high-cardinality labels anywhere.
 --
 --   http {
@@ -44,6 +44,30 @@ local metric_anomalies = prometheus:counter(
     "adaptive_limit_counter_anomalies_total", "Counter anomalies", { "limiter" })
 
 local limiters = {}
+local prev_counts = {}
+
+local function inc_delta(metric, name, field, current, labels)
+    current = current or 0
+    -- Keyed per worker: /metrics can be served by any worker process, and
+    -- each worker's lim:state() counters are worker-local (see
+    -- limiter.lua's state() doc). Without the worker id, a scrape landing
+    -- on a different worker than the previous one looks like a counter
+    -- reset and its whole total gets re-added on top of what was already
+    -- counted. Keying by worker keeps each worker's own series monotonic;
+    -- the metric still sums correctly across workers over time.
+    local key = name .. ":" .. field .. ":" .. tostring(ngx.worker.id())
+    local prev = prev_counts[key] or 0
+    if current >= prev then
+        local delta = current - prev
+        if delta > 0 then
+            metric:inc(delta, labels)
+        end
+    else
+        -- counter reset (e.g. process reload/restart)
+        metric:inc(current, labels)
+    end
+    prev_counts[key] = current
+end
 
 local M = {}
 
@@ -66,18 +90,21 @@ function M.collect()
     for i = 1, #limiters do
         local lim = limiters[i]
         local s = lim:state() -- a handful of dict reads per scrape: fine
-        local labels = { lim.cfg.name }
+        local name = lim.cfg.name
+        local labels = { name }
         metric_limit:set(s.limit or 0, labels)
         metric_inflight:set(s.inflight or 0, labels)
-        metric_admitted:inc(s.admitted_total, labels)
-        metric_rejected:inc(s.rejected_total, labels)
+        -- Note: worker-local cumulative stats reflect the worker(s) serving
+        -- /metrics; increment by deltas to avoid polynomial over-counting
+        inc_delta(metric_admitted, name, "admitted", s.admitted_total, labels)
+        inc_delta(metric_rejected, name, "rejected", s.rejected_total, labels)
         if s.short_rtt then metric_short_rtt:set(s.short_rtt, labels) end
         if s.long_rtt then metric_long_rtt:set(s.long_rtt, labels) end
         if s.gradient then metric_gradient:set(s.gradient, labels) end
-        metric_updates:inc(s.controller_updates, labels)
-        metric_skips:inc(s.controller_skips, labels)
-        metric_internal:inc(s.internal_errors, labels)
-        metric_anomalies:inc(s.counter_anomalies, labels)
+        inc_delta(metric_updates, name, "updates", s.controller_updates, labels)
+        inc_delta(metric_skips, name, "skips", s.controller_skips, labels)
+        inc_delta(metric_internal, name, "internal", s.internal_errors, labels)
+        inc_delta(metric_anomalies, name, "anomalies", s.counter_anomalies, labels)
     end
 end
 

@@ -1,4 +1,4 @@
--- Configuration validation (spec §30). Guards against silently accepted
+-- Configuration validation (design.md §3). Guards against silently accepted
 -- nonsense — including the multi-value-return trap where a validator's
 -- error string is assigned into a single local and reads as nil.
 
@@ -41,7 +41,7 @@ describe("config.build", function()
             profile = "aggressive" }))
     end)
 
-    it("rejects every spec §30 case", function()
+    it("rejects every invalid configuration case", function()
         local cases = {
             { name = "x", shared_dict = "d", min_limit = 0 },
             { name = "x", shared_dict = "d", min_limit = 100, max_limit = 10 },

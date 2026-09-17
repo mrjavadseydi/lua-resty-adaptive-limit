@@ -1,4 +1,4 @@
--- Configuration building and validation (spec §30).
+-- Configuration building and validation (design.md §3).
 --
 -- Everything here runs once, in adaptive.new() — never per request. The
 -- result is a *flattened* config of scalar fields: the request path and

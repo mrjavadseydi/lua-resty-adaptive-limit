@@ -1,4 +1,4 @@
--- Deterministic controller simulations (spec §53, scenarios A–H).
+-- Deterministic controller simulations (design.md §14, scenarios A–H).
 --
 -- Backend model: fixed capacity C and base RTT R with a queueing knee —
 --   rtt(A)   = R * (1 + 8 * max(0, A - C) / C)          (A = admitted concurrency)
@@ -9,7 +9,7 @@
 -- The limiter observes only completions (latency samples, outcome
 -- counts) — exactly what the real controller sees through the window
 -- accumulators. Defaults in these scenarios are the library defaults;
--- they are the justification (spec §22) for those defaults.
+-- they are the justification (design.md §4) for those defaults.
 
 local g2 = require "resty.adaptive_limit.controller.gradient2"
 local aimd = require "resty.adaptive_limit.controller.aimd"

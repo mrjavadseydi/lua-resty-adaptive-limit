@@ -1,5 +1,5 @@
 #!/bin/bash
-# Real-traffic resilience harness (spec §55/§56): continuous wrk load
+# Real-traffic resilience harness (design.md §14): continuous wrk load
 # against an adaptive-limited upstream while the server is HUP-reloaded
 # RELOADS times and one worker is SIGKILLed mid-flight. Verifies:
 #   - no permanent lockout and no error spike across reloads

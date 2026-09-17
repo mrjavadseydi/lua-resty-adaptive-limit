@@ -77,7 +77,7 @@ function _M.update(state, m, cfg)
         + m.connect_error_count
     -- strong overload signals only: 503s, timeouts and upstream connect
     -- failures; plain application errors (500-class) are never treated
-    -- as capacity signals (spec §14)
+    -- as capacity signals (design.md §4)
     local overloaded = failure_count / sc > cfg.overload_failure_ratio
 
     local long_rtt = state.long_rtt

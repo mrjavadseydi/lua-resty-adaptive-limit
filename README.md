@@ -234,6 +234,8 @@ dropped with an anomaly; they cannot corrupt statistics. `outcome`:
 `"aborted"`, `"ignored"` (default `"success"`). Aborted requests release
 their slot but contribute no latency sample (a truncated duration is not a
 capacity signal); `ignored` contributes nothing at all (health checks).
+Passing an invalid outcome returns `nil, "invalid_state"` and the slot is
+**not** released — pass `nil` or a valid outcome string.
 A negative counter result — double release — is snapped to zero and
 counted as an anomaly; it is surfaced, never hidden.
 
@@ -255,8 +257,10 @@ targets — **bypass admission by default**: subrequests never get a log
 phase and exec chains run their log phase only at the final location, so
 admitting there would leak a slot per request. Locations that are only
 reached through `ngx.exec`/X-Accel-Redirect should own the limiter with
-`allow_internal = true`. (All of this behavior is pinned by tests; see
-`t/lifecycle.t`.)
+`allow_internal = true`.
+
+**Important lifecycle rule:** *the location that admits must be the location whose log phase runs.*
+When an admitting location redirects internally (e.g. `ngx.exec` or `error_page 502 = /fallback`), nginx executes only the final location's log phase and resets `ngx.ctx`. If an admitting location uses `error_page` redirect, the fallback location must explicitly release the slot using `limiter:release(nil, outcome)` to prevent leaking concurrency slots. (All of this behavior is pinned by tests; see `t/lifecycle.t`.)
 
 ### `limiter:log() -> true`
 
@@ -281,21 +285,21 @@ signal), everything else → success. Override with
 
 ### `limiter:enforce(err)`
 
-*Allowed contexts:* phases that may produce a response. Maps `rejected` to
-`rejection_status` (default 503 — backend capacity exhaustion; 429 fits
-client-facing quota policies instead) with a `Retry-After` header;
-internal errors map to 500. Convenience only — kept outside the core.
+Convenience helper for producing the standard rejection response:
+maps `"rejected"` to the configured status (503 by default) with a
+`Retry-After` header; internal errors map to 500.
 
 ### `limiter:state() -> table`
 
 *Yields:* no; performs a handful of shared-dict reads — **not** for the
 request path. Returns shared state (`limit`, `float_limit`, `inflight`,
 `short_rtt`, `long_rtt`, `gradient`, `last_window`, `last_update`, last
-closed window's raw accumulators), worker-local counters (`admitted_total`,
-`rejected_total`, `controller_updates`, `controller_skips`,
-`internal_errors`, `counter_anomalies`, `timer_failures`), and diagnostics:
-`controller_stalled` (pool exhausted with no recent completions — the hung-
-backend scenario; backpressure still holds and this makes it visible),
+closed window's raw accumulators — note: accumulators are deleted once
+processed, so `last_sample_count` is non-zero only during the grace window),
+worker-local counters (`admitted_total`, `rejected_total`, `controller_updates`,
+`controller_skips`, `internal_errors`, `counter_anomalies`, `timer_failures`),
+and diagnostics: `controller_stalled` (pool exhausted with no recent completions —
+the hung-backend scenario; backpressure still holds and this makes it visible),
 `workers_active`/`workers_expected` (heartbeat liveness),
 `last_completion_age`, `shared_dict_capacity`/`shared_dict_free`.
 

@@ -1,5 +1,5 @@
 -- Request lifecycle helpers (access/log) against the ngx mock: covers
--- spec §52 semantics that do not need real nginx (double log, release
+-- design.md §2 semantics that do not need real nginx (double log, release
 -- without acquire, internal redirect, bypass, fail-open/closed,
 -- classification). The full HTTP-level lifecycle runs in t/lifecycle.t.
 
@@ -8,11 +8,13 @@ local adaptive = require "resty.adaptive_limit"
 local errors = adaptive.errors
 local runtime = require "resty.adaptive_limit.runtime"
 local http = require "resty.adaptive_limit.http"
+local scheduler = require "resty.adaptive_limit.scheduler"
 
 local function fresh_limiter(cfg_overrides)
     runtime.started = false
     runtime.registry = {}
     runtime.order = {}
+    scheduler.reset()
     ngx.reset()
     ngx.shared.adaptive_limit = ngx.make_dict()
 
@@ -248,9 +250,24 @@ describe("http.reject helper", function()
         assert.are.equal("2", ngx.header["Retry-After"])
     end)
 
-    it("maps internal errors to 500", function()
+    it("maps internal errors to 500 without Retry-After header", function()
         local limiter = fresh_limiter()
+        ngx.header["Retry-After"] = nil
         http.reject(limiter.cfg, errors.INTERNAL_ERROR)
         assert.are.equal(500, ngx._last_exit)
+        assert.is_nil(ngx.header["Retry-After"])
+    end)
+end)
+
+describe("scheduler timer management", function()
+    it("reuses recurring timer across start/stop/start cycles", function()
+        fresh_limiter()
+        assert.are.equal(1, ngx._timer_calls)
+        assert.True(adaptive.stop())
+        assert.False(scheduler.running)
+        assert.True(adaptive.start())
+        assert.True(scheduler.running)
+        -- Still exactly 1 timer call (no duplicate timer created)
+        assert.are.equal(1, ngx._timer_calls)
     end)
 end)

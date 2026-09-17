@@ -20,8 +20,8 @@ local _M = {}
 function _M.reject(cfg, err)
     -- ngx.header is per-request: it must be read at call time, never
     -- cached at module load
-    ngx.header["Retry-After"] = tostring(cfg.retry_after)
     if err == errors.REJECTED then
+        ngx.header["Retry-After"] = tostring(cfg.retry_after)
         ngx_exit(cfg.rejection_status)
         return
     end

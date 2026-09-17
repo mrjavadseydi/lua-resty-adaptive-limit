@@ -1,5 +1,5 @@
 #!/bin/bash
-# Benchmark harness (spec §58/§59): always against a no-limiter baseline.
+# Benchmark harness (design.md §14): always against a no-limiter baseline.
 #
 # Runs inside the harness container:
 #   docker run --rm -v $PWD:/work -w /work <image> benchmark/run.sh
@@ -10,8 +10,8 @@
 #   fixed             fixed shared-dict counter (resty.limit.conn shape)
 #   adaptive-huge     full adaptive limiter, limit 100000 (pure admission cost)
 #   adaptive-tiny     limit 2 (heavy rejection path)
-#   adaptive-ctrl     limit 20 with 1ms upstream, controller active
-#   adaptive-ctrl5ms  limit 20 with 5ms upstream, controller active
+#   adaptive-ctrl     limit 40 with 1ms upstream, controller active
+#   adaptive-ctrl5ms  limit 40 with 5ms upstream, controller active
 #   adaptive-many16   1 limiter on the request path, scheduler serving 16
 # Worker counts: 1, 2, 4. Raw wrk output lands in benchmark/results/.
 

@@ -1,4 +1,4 @@
-# Request-lifecycle integration tests (spec §52): access/log ordering,
+# Request-lifecycle integration tests (design.md §2): access/log ordering,
 # idempotence, internal redirects, bypass, failure modes, rejection
 # responses, and outcome classification over real nginx phases.
 # Client aborts (499) are covered at the classifier level in
@@ -428,3 +428,51 @@ location /stats {
 ]
 --- no_error_log
 [alert]
+
+=== TEST 10: error_page fallback — slot released when fallback explicitly releases
+# In Nginx, internal redirection (error_page) resets ngx.ctx and skips the
+# admitting location's log phase. If an admitting location redirects via
+# error_page, the fallback location must explicitly release the slot
+# (e.g. via PAY:release(nil, outcome)) to prevent leaking concurrency.
+--- http_config
+lua_package_path '/work/lib/?.lua;;';
+lua_shared_dict adaptive_limit 1m;
+init_worker_by_lua_block {
+    local adaptive = require("resty.adaptive_limit")
+    PAY = assert(adaptive.new({ name = "pay", shared_dict = "adaptive_limit",
+        initial_limit = 10, min_limit = 1, max_limit = 10 }))
+    assert(adaptive.start())
+}
+--- config
+location /api {
+    access_by_lua_block { PAY:access() }
+    proxy_pass http://127.0.0.1:1;
+    error_page 502 = /fallback;
+}
+location /fallback {
+    content_by_lua_block {
+        ngx.say("fallback response")
+    }
+    log_by_lua_block {
+        PAY:release(nil, "connect_error")
+    }
+}
+location /stats {
+    content_by_lua_block {
+        ngx.say("inflight=", ngx.shared.adaptive_limit:get("al:1:pay:inflight"),
+            " admitted=", PAY.stats.admitted_total,
+            " connect_error=", PAY.stats.connect_error)
+    }
+}
+--- request eval
+["GET /api", "GET /stats"]
+--- response_body eval
+[
+"fallback response
+",
+"inflight=0 admitted=1 connect_error=1
+"
+]
+--- no_error_log
+[alert]
+

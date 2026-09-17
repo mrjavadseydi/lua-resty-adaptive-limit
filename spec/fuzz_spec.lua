@@ -1,4 +1,4 @@
--- Property/fuzz tests (spec §54) over generated measurement sequences.
+-- Property/fuzz tests (design.md §14) over generated measurement sequences.
 --
 -- Deterministic: a pure-Lua LCG, fixed seed. Properties:
 --   - published limit always finite, positive, min_limit <= limit <= max_limit
@@ -51,7 +51,7 @@ local function gen_measurement(rand)
             { sample_count = 100, mean_rtt = 1 / 0 },
             { sample_count = -5, mean_rtt = 0.1 },
             { sample_count = 100, mean_rtt = -0.1 },
-            { sample_count = 10, overload_count = 11 },
+            { sample_count = 10, overload_count = 11, completions = 10 },
             { sample_count = "many", mean_rtt = 0.1 },
         }
         return corrupt[rand(6) + 1], true
@@ -69,6 +69,10 @@ local function gen_measurement(rand)
     if rand(10) == 0 then
         m.aborted_count = rand(math.min(m.sample_count or 0, 100) + 1)
     end
+    -- every sampled or class-counted outcome is a completion; the slack
+    -- models completions that were neither (unusable latency, success)
+    m.completions = m.sample_count + (m.overload_count or 0)
+        + (m.timeout_count or 0) + (m.aborted_count or 0) + rand(10)
     return m, false
 end
 

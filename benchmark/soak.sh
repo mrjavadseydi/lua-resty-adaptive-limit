@@ -1,5 +1,5 @@
 #!/bin/bash
-# Soak harness (spec §57): sustained traffic with periodic sampling of
+# Soak harness (design.md §14): sustained traffic with periodic sampling of
 # worker RSS, Lua GC size, shared-dict usage and inflight. Memory must
 # stabilize — no structure may grow with the number of requests served.
 #
@@ -126,8 +126,8 @@ END {
         if (rss[i] < minr) minr = rss[i]
         if (rss[i] > maxr) maxr = rss[i]
     }
-    printf "[soak] gc:  range %d..%d kB, quarter-growth %+.0f kBn", ming, maxg, gg
-    printf "[soak] rss: range %d..%d kB, quarter-growth %+.0f kBn", minr, maxr, rg
+    printf "[soak] gc:  range %d..%d kB, quarter-growth %+.0f kB\n", ming, maxg, gg
+    printf "[soak] rss: range %d..%d kB, quarter-growth %+.0f kB\n", minr, maxr, rg
     if (gg < 512 && rg < 20480) {
         print "[soak] PASS: memory stable"
     } else {
