@@ -36,3 +36,23 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/work -w /work adlim-harness \
             sh -c 'TEST_NGINX_SERVROOT=/tmp/adlim-servroot prove -I. -r t/'
+
+  minimum-version:
+    # The documented floor is OpenResty 1.15.8.1 (lua-nginx-module
+    # 0.10.15 introduced exit_worker_by_lua*). Verified via a direct
+    # smoke test under amd64 emulation; full Test::Nginx on the oldest
+    # image is impractibly slow under QEMU on arm64 hosts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build minimum-version harness
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg OPENRESTY_IMAGE=openresty/openresty:1.15.8.3-2-bionic \
+            -t adlim-harness-min -f docker/Dockerfile.test .
+      - name: Smoke test on OpenResty 1.15.8.3
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD":/work -w /work adlim-harness-min \
+            resty --http-conf "lua_shared_dict smoke_dict 1m;" \
+            -I /work/lib t/smoke_min_version.lua
