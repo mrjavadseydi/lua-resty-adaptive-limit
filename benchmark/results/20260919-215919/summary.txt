@@ -1,0 +1,3 @@
+baseline-w1: median=15317.17 rps (reps: 12858.89 16025.96 15317.17)
+baseline-w2: median=25090.73 rps (reps: 22876.50 25740.73 25090.73)
+baseline-w4: median=29615.77 rps (reps: 29153.90 29615.77 29967.72)

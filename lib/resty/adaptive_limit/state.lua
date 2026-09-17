@@ -80,8 +80,11 @@ end
 
 -- Atomic add of a partial aggregate into window n. init 0 makes the
 -- first writer create the key; concurrent flushers serialize inside the
--- shared dictionary. window_ttl is applied when this worker first touches
--- the window's keys (rollover detection via the caller).
+-- shared dictionary. window_ttl is applied on EVERY write (not just the
+-- first): a field whose first write lands after a worker's first flush
+-- of the window must still get the backstop expiry, and this way no
+-- per-worker rollover state is needed. One extra expire per written
+-- field per tick — control-path cost only.
 function _M:add_window(n, field, delta, window_ttl)
     local keys = self:window_keys(n)
     local key = keys[field]
@@ -89,14 +92,7 @@ function _M:add_window(n, field, delta, window_ttl)
     if not value then
         return nil, err
     end
-    if self._ttl_set ~= n then
-        -- once per window per worker: backstop expiry so window keys can
-        -- never outlive their usefulness even if no controller ever runs
-        self._ttl_set = n
-        for i = 1, #WINDOW_FIELDS do
-            self.dict:expire(keys[WINDOW_FIELDS[i]], window_ttl)
-        end
-    end
+    self.dict:expire(key, window_ttl)
     return value
 end
 

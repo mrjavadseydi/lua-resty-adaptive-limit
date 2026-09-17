@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build harness
+        run: docker build -t adlim-harness -f docker/Dockerfile.test .
+      - name: busted unit tests, fuzz properties, simulations
+        run: docker run --rm -v "$PWD":/work -w /work adlim-harness busted spec/
+
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # minimum supported / representative stable / latest
+        openresty:
+          - openresty/openresty:1.15.8.3-2-bionic
+          - openresty/openresty:1.21.4.4-1-bookworm
+          - openresty/openresty:1.31.1.1-3-jammy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build harness on ${{ matrix.openresty }}
+        run: |
+          docker build -t adlim-harness \
+            --build-arg OPENRESTY_IMAGE=${{ matrix.openresty }} \
+            -f docker/Dockerfile.test .
+      - name: Test::Nginx integration suite
+        run: |
+          docker run --rm -v "$PWD":/work -w /work adlim-harness \
+            sh -c 'TEST_NGINX_SERVROOT=/tmp/adlim-servroot prove -I. -r t/'

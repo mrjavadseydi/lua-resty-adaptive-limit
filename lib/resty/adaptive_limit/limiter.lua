@@ -70,14 +70,14 @@ local mt = { __index = _M }
 
 -- rate_limited_log(self, kind, level, ...)
 -- Returns true if the message was emitted within the budget.
-local function rate_limited_log(self, kind, level, msg)
+local function rate_limited_log(self, kind, level, ...)
     local now = ngx_now()
     local last = self._log_last[kind]
     if last and now - last < LOG_INTERVAL then
         return false
     end
     self._log_last[kind] = now
-    ngx_log(level, "adaptive_limit[", self.cfg.name, "] ", msg)
+    ngx_log(level, "adaptive_limit[", self.cfg.name, "] ", ...)
     return true
 end
 
@@ -85,7 +85,8 @@ local function count_anomaly(self, kind)
     self.anomalies[kind] = (self.anomalies[kind] or 0) + 1
     local hook = self.cfg.on_anomaly
     if hook then
-        hook(kind, nil)
+        -- pcall: user code must never break accounting (invariant 10)
+        pcall(hook, kind, self.anomalies[kind])
     end
 end
 
@@ -191,26 +192,40 @@ function _M:reseed_shared_state()
     self._last_limit = cfg.initial_limit
 end
 
--- Validate the shared state schema marker; reseed if absent, refuse on
--- mismatch. Called from adaptive.start() (init_worker) and after schema
--- errors detected at runtime.
+-- Validate the shared state schema marker and this limiter's own keys;
+-- reseed what is missing, refuse on mismatch. Called from
+-- adaptive.start() (init_worker).
+--
+-- The schema marker is dict-global but the controller keys are
+-- per-limiter: without step 2 below, only the FIRST limiter in a zone
+-- would get seeded at startup and every later limiter would lazily
+-- create its limit key on the first admission (surfacing a spurious
+-- anomaly per deployment).
 function _M:check_schema()
     local st = self.st
+    local dict = st.dict
     local v, err = st:read_schema()
     if v == nil then
         if err and err ~= "not found" then
             return nil, errors.INTERNAL_ERROR
         end
         -- no marker: first worker here, or the dict was flushed
-        self:reseed_shared_state()
-        return true
-    end
-    if v ~= tostring(state_mod.SCHEMA_VERSION) then
+        st:write_schema()
+    elseif v ~= tostring(state_mod.SCHEMA_VERSION) then
         rate_limited_log(self, "schema", ngx_ERR,
             "shared state schema version ", tostring(v),
             " is not supported (expected ", tostring(state_mod.SCHEMA_VERSION),
             "); refusing to reuse incompatible state")
         return nil, errors.INVALID_STATE
+    end
+
+    -- per-limiter key existence (second+ limiters in a shared zone)
+    local limit, lerr = dict:get(self.K_limit)
+    if limit == nil then
+        if lerr and lerr ~= "not found" then
+            return nil, errors.INTERNAL_ERROR
+        end
+        self:reseed_shared_state()
     end
     return true
 end
@@ -624,15 +639,21 @@ function _M:control(now)
         return
     end
 
-    -- stale backlog: never replay old windows after a long pause
+    -- stale backlog: never replay old windows after a long pause. On a
+    -- fresh boot `last` is 0 and epoch-based window ids make n_ready
+    -- astronomically large; the clamp below applies either way, but only
+    -- a genuine pause (last > 0) counts as "skipped" — boot is not a
+    -- pause.
     local from = last + 1
     if n_ready - from + 1 > MAX_WINDOWS_PER_TICK then
-        local skipped = n_ready - MAX_WINDOWS_PER_TICK - last
-        self.controller_skips = (self.controller_skips or 0) + skipped
-        rate_limited_log(self, "stale", ngx_WARN,
-            "skipping ", tostring(skipped),
-            " stale controller windows after a pause")
         from = n_ready - MAX_WINDOWS_PER_TICK + 1
+        if last > 0 then
+            local skipped = from - last - 1
+            self.controller_skips = (self.controller_skips or 0) + skipped
+            rate_limited_log(self, "stale", ngx_WARN,
+                "skipping ", tostring(skipped),
+                " stale controller windows after a pause")
+        end
     end
 
     for n = from, n_ready do

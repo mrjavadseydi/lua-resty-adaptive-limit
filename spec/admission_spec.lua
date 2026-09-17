@@ -72,6 +72,27 @@ describe("admission", function()
         assert.are.equal(0, dict._data["al:1:payments:inflight"])
     end)
 
+    it("seeds every limiter sharing one zone, not just the first", function()
+        runtime.started = false
+        runtime.registry = {}
+        runtime.order = {}
+        ngx.reset()
+        ngx.shared.adaptive_limit = ngx.make_dict()
+        local a = assert(adaptive.new({ name = "one",
+            shared_dict = "adaptive_limit", initial_limit = 10,
+            min_limit = 1, max_limit = 100 }))
+        local b = assert(adaptive.new({ name = "two",
+            shared_dict = "adaptive_limit", initial_limit = 20,
+            min_limit = 1, max_limit = 100 }))
+        assert(adaptive.start())
+        local d = ngx.shared.adaptive_limit._data
+        assert.are.equal(10, d["al:1:one:limit"])
+        assert.are.equal(20, d["al:1:two:limit"])
+        -- and neither limiter raised a missing-limit anomaly afterwards
+        assert.Nil(a.anomalies.limit_missing)
+        assert.Nil(b.anomalies.limit_missing)
+    end)
+
     it("caps simultaneous admissions at the limit (invariant 1)", function()
         local limiter, dict = fresh_env()
         for _ = 1, 10 do

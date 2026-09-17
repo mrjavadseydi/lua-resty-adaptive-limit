@@ -9,7 +9,7 @@ OPENRESTY_IMAGE ?= openresty/openresty:1.31.1.1-3-jammy
 # Test::Nginx scratch lives outside the repo mount so repeated runs stay clean.
 TEST_ENV := TEST_NGINX_SERVROOT=/tmp/adlim-servroot TEST_NGINX_RANDOM_DELAY=off
 
-.PHONY: image test test-unit test-integration sim bench soak shell clean
+.PHONY: image test test-unit test-integration sim bench soak resilience shell clean
 
 image:
 	docker build -t $(IMAGE) --build-arg OPENRESTY_IMAGE=$(OPENRESTY_IMAGE) -f docker/Dockerfile.test .
@@ -36,6 +36,10 @@ bench:
 # Bounded soak (default 10 minutes; override SOAK_SECONDS for longer runs)
 soak:
 	docker run --rm -v $(CURDIR):/work -w /work $(IMAGE) benchmark/soak.sh
+
+# HUP reloads + worker SIGKILL under real wrk traffic
+resilience:
+	docker run --rm -v $(CURDIR):/work -w /work $(IMAGE) benchmark/resilience.sh
 
 shell:
 	docker run --rm -it -v $(CURDIR):/work -w /work $(IMAGE)
