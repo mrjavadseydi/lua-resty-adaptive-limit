@@ -143,7 +143,8 @@ with a descriptive error — never silently accepted.
 | `rejection_status` | number | 503 | used only by `enforce()` |
 | `retry_after` | string/number | 1 | used only by `enforce()` |
 | `stale_threshold` | number | 30 | seconds without completions before `controller_stalled` is reported |
-| `on_update` | function | nil | `function(snapshot)` after each controller publish |
+| `on_update` | function | nil | `function(snapshot)` after each controller publication (held windows fire nothing) |
+| `allow_internal` | boolean | false | admit on internal requests (exec-fronted locations; see §2) |
 | `on_anomaly` | function | nil | `function(kind, detail)` for counter anomalies / internal errors |
 
 Profiles (tuned via simulation, see `spec/simulation_spec.lua`):
