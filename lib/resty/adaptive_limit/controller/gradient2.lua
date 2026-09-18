@@ -7,7 +7,7 @@
 --   limit     current limit (float internally; published as an integer
 --             by the wiring at the publication boundary)
 --   long_rtt  slow EWMA of healthy RTT (the capacity baseline); nil
---             before the first sufficient window
+--             before the first sufficient non-overloaded window
 --   short_rtt fast EWMA of observed RTT; nil before the first sufficient
 --             window
 --   gradient  last computed gradient (diagnostics)
@@ -80,16 +80,18 @@ function _M.update(state, m, cfg)
     -- as capacity signals (design.md §4)
     local overloaded = failure_count / sc > cfg.overload_failure_ratio
 
+    -- The baseline is frozen on overloaded windows — including the very
+    -- first one: seeding it from an overloaded RTT (restart mid-incident)
+    -- would teach the controller that the overload is "healthy". With no
+    -- baseline yet the gradient stays 1.0 and only the overload backoff
+    -- acts; the first healthy window seeds it.
     local long_rtt = state.long_rtt
     if not overloaded then
         long_rtt = ewma(long_rtt, short_rtt, cfg.baseline_alpha)
     end
-    if long_rtt == nil then
-        long_rtt = short_rtt
-    end
 
     local gradient = 1.0
-    if short_rtt > 0 then
+    if long_rtt ~= nil and short_rtt > 0 then
         gradient = clamp(cfg.rtt_tolerance * long_rtt / short_rtt,
                          cfg.min_gradient, 1.0)
     end

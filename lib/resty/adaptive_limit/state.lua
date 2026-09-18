@@ -110,7 +110,8 @@ function _M:read_window(n)
         if v == nil and err and err ~= "not found" then
             return nil, err
         end
-        out[f] = v or 0
+        -- a foreign non-numeric value reads as an empty accumulator
+        out[f] = type(v) == "number" and v or 0
     end
     return out
 end
@@ -128,6 +129,11 @@ end
 -- anyway thanks to the last_window guard).
 function _M:try_lease(n, owner, ttl)
     return self.dict:add(self.prefix .. "lease:" .. n, owner, ttl)
+end
+
+-- True while some worker holds (or recently held) the lease on window n.
+function _M:lease_held(n)
+    return self.dict:get(self.prefix .. "lease:" .. n) ~= nil
 end
 
 function _M:heartbeat(worker_id, now, ttl)

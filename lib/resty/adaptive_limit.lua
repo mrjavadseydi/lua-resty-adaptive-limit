@@ -85,6 +85,18 @@ function _M.start(opts)
         if wid ~= nil then
             limiter:heartbeat(wid)
         end
+        -- The scheduler assumes it ticks at least once per window and
+        -- well within the heartbeat TTL. A slower cadence is legal (tests
+        -- drive ticks by hand) but in production it silently drops
+        -- windows and flaps workers_active — say so.
+        local fi = runtime.flush_interval
+        if fi > limiter.cfg.sample_window or fi >= limiter_mod.HB_TTL then
+            ngx.log(ngx.WARN, "adaptive_limit[", limiter.cfg.name,
+                "] flush_interval ", fi, " exceeds sample_window ",
+                limiter.cfg.sample_window, " or the heartbeat TTL ",
+                limiter_mod.HB_TTL, ": controller windows will be skipped ",
+                "and worker liveness will flap")
+        end
     end
 
     local sok, serr = scheduler.start()

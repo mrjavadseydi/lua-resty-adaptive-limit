@@ -22,6 +22,10 @@ local function access()
     local ok, err = payments:try_acquire()
 
     if ok then
+        -- The log phase runs for EVERY request, including rejected and
+        -- fail-open ones: mark the slot so log() releases only what was
+        -- actually acquired.
+        ngx.ctx.payments_slot = true
         return true
     end
 
@@ -47,6 +51,10 @@ end
 
 -- log_by_lua -----------------------------------------------------------
 local function log()
+    if not ngx.ctx.payments_slot then
+        return -- rejected or admitted without a slot: nothing to release
+    end
+    ngx.ctx.payments_slot = nil
     -- release() decrements first, records the observation second;
     -- it never yields. Outcomes: success, timeout, connect_error,
     -- overload, error, aborted, ignored.

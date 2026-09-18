@@ -378,7 +378,8 @@ Documented honestly, with the reasoning:
   error log per second per kind — normal traffic never logs.
 * **Missing/corrupted critical state** (eviction, operator flush,
   corruption): re-seeded from the worker's last observed limit — fresh to
-  within one window — with a `limit_missing`/`limit_corrupted` anomaly.
+  within one window — with a `limit_missing`/`limit_corrupted` anomaly;
+  a non-numeric `inflight` counter is snapped to 0 (`inflight_corrupted`).
   The limiter never crashes a request comparing against garbage.
 * **Graceful reload (`nginx -s reload`)**: the shared dictionary
   survives; new workers validate the schema marker and adopt the learned

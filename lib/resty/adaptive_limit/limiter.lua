@@ -82,8 +82,10 @@ local function rate_limited_log(self, kind, level, ...)
     return true
 end
 
-local function count_anomaly(self, kind)
-    self.anomalies[kind] = (self.anomalies[kind] or 0) + 1
+-- Every anomaly counter goes through here so the on_anomaly hook sees
+-- all of them (README: "on anomalies/internal errors"). n defaults to 1.
+local function count_anomaly(self, kind, n)
+    self.anomalies[kind] = (self.anomalies[kind] or 0) + (n or 1)
     local hook = self.cfg.on_anomaly
     if hook then
         -- pcall: user code must never break accounting (invariant 10)
@@ -96,7 +98,25 @@ local function internal_error(self, where, err)
     self.internal_errors = self.internal_errors + 1
     rate_limited_log(self, "internal", ngx_ERR,
         where, " failed: ", err or "unknown")
+    local hook = self.cfg.on_anomaly
+    if hook then
+        pcall(hook, "internal_error", self.internal_errors)
+    end
     return nil, errors.INTERNAL_ERROR
+end
+
+-- A non-numeric inflight counter (foreign write into the zone) would turn
+-- every incr into an internal error — permanent fail-open. Snap it to 0
+-- and surface, like the limit key.
+local function repair_inflight(self, dict, err)
+    if err ~= "not a number" then
+        return false
+    end
+    count_anomaly(self, "inflight_corrupted")
+    dict:set(self.K_inflight, 0)
+    rate_limited_log(self, "inflight_corrupted", ngx_ERR,
+        "inflight key corrupted (non-numeric); re-seeded to 0")
+    return true
 end
 
 function _M.new(user_cfg)
@@ -161,8 +181,10 @@ function _M.new(user_cfg)
         -- ngx.ctx key, precomputed once ("alim:" .. name)
         _ctx_key = "alim:" .. cfg.name,
 
-        -- flush bookkeeping (scheduler)
+        -- flush bookkeeping (scheduler); _flush_pending is the window a
+        -- partially failed flush must finish before moving on
         _flush_window = nil,
+        _flush_pending = nil,
         -- flushed-marker mirror of the monotonic stats fields: flush()
         -- writes deltas against these into the shared window
         -- accumulators and advances them by exactly the written delta
@@ -291,7 +313,7 @@ function _M:try_acquire()
         -- Re-seed from this worker's last observed limit (fresh to within
         -- one window) and surface the anomaly instead of admitting
         -- unbounded.
-        self.anomalies.limit_missing = (self.anomalies.limit_missing or 0) + 1
+        count_anomaly(self, "limit_missing")
         limit = self._last_limit or self.cfg.initial_limit
         dict:set(self.K_limit, limit)
         rate_limited_log(self, "limit_missing", ngx_WARN,
@@ -300,8 +322,7 @@ function _M:try_acquire()
         -- Corrupted shared value: never trust it and never crash the
         -- request comparing against it. Replace with the
         -- last observed limit and surface.
-        self.anomalies.limit_corrupted =
-            (self.anomalies.limit_corrupted or 0) + 1
+        count_anomaly(self, "limit_corrupted")
         limit = self._last_limit or self.cfg.initial_limit
         dict:set(self.K_limit, limit)
         rate_limited_log(self, "limit_corrupted", ngx_ERR,
@@ -311,6 +332,9 @@ function _M:try_acquire()
 
     -- Admission linearization point (see top-of-file comment).
     local n, ierr = dict:incr(self.K_inflight, 1, 0)
+    if not n and repair_inflight(self, dict, ierr) then
+        n, ierr = dict:incr(self.K_inflight, 1, 0)
+    end
     if not n then
         return internal_error(self, "incr(inflight)", ierr)
     end
@@ -367,6 +391,10 @@ function _M:release(latency, outcome)
 
     -- 1. Release the slot. This must succeed for accounting to hold.
     local n, err = dict:incr(self.K_inflight, -1)
+    if not n and repair_inflight(self, dict, err) then
+        -- the counter was garbage: the slot no longer exists to release
+        n = 0
+    end
     if not n then
         -- The slot leaks; surfaced via internal_errors and the stuck
         -- diagnostics. The caller may retry the release once.
@@ -374,8 +402,7 @@ function _M:release(latency, outcome)
     end
     if n < 0 then
         -- Double release (or a lost admission): snap to zero and surface.
-        self.anomalies.negative_inflight =
-            (self.anomalies.negative_inflight or 0) + 1
+        count_anomaly(self, "negative_inflight")
         dict:set(self.K_inflight, 0)
         rate_limited_log(self, "negative", ngx_WARN,
             "inflight went negative; double release suspected")
@@ -435,7 +462,12 @@ end
 -- keeps the math exact even if a future dict op were to yield.
 function _M:flush(now)
     local cfg = self.cfg
-    local win = floor(now / cfg.sample_window)
+    -- A flush that failed part-way keeps targeting the SAME window until
+    -- every field has landed: the fields of one completion must never be
+    -- split across two windows (c/s in N, cmp in N+1 fails validation in
+    -- both). A stale target past its grace is at worst lost, never
+    -- corrupting.
+    local win = self._flush_pending or floor(now / cfg.sample_window)
     local s = self.stats
     local flushed = self._flushed
     local ttl = cfg.sample_window + cfg.aggregation_grace + 15
@@ -452,12 +484,14 @@ function _M:flush(now)
                 self.internal_errors = self.internal_errors + 1
                 rate_limited_log(self, "flush", ngx_ERR,
                     "window flush failed: ", err or "unknown")
+                self._flush_pending = win
                 return win
             end
             flushed[f] = flushed[f] + delta
         end
     end
 
+    self._flush_pending = nil
     self._flush_window = win
     return win
 end
@@ -668,7 +702,9 @@ function _M:control(now)
         return
     end
 
-    local last = cs.last_window or 0
+    -- a non-numeric last_window (foreign write) must not throw on every
+    -- tick: treat it as "never processed"; the next publish repairs it
+    local last = tonumber(cs.last_window) or 0
     local n_ready = floor((now - cfg.aggregation_grace) / sw) - 1
     if n_ready <= last then
         return
@@ -681,6 +717,13 @@ function _M:control(now)
     -- pause.
     local from = last + 1
     if n_ready - from + 1 > MAX_WINDOWS_PER_TICK then
+        -- Jumping ahead while another worker still holds the lease on
+        -- last+1 would publish a later window before an earlier one
+        -- (last_window regresses, the newer limit is overwritten). Its
+        -- publish advances last_window; wait for it.
+        if last > 0 and st:lease_held(from) then
+            return
+        end
         from = n_ready - MAX_WINDOWS_PER_TICK + 1
         if last > 0 then
             local skipped = from - last - 1
@@ -766,7 +809,9 @@ function _M:control_window(n, now)
         -- RTT values do not permanently wedge the controller across reloads
         local repaired_state, repaired = common_ctrl.repair_state(state, cfg)
         if repaired then
-            rate_limited_log(self, "controller", ngx_WARN,
+            -- own kind: the "controller" ERR just above would otherwise
+            -- always suppress this line
+            rate_limited_log(self, "repair", ngx_WARN,
                 "repaired invalid shared controller state during hold: limit=",
                 tostring(repaired_state.limit))
         end
@@ -835,8 +880,7 @@ function _M:exit_worker()
         dict:set(self.K_inflight, 0)
     end
     self._inflight = 0
-    self.anomalies.exit_with_inflight =
-        (self.anomalies.exit_with_inflight or 0) + held
+    count_anomaly(self, "exit_with_inflight", held)
     rate_limited_log(self, "exit", ngx_WARN,
         "worker exited holding ", tostring(held),
         " slots; reconciled shared counter")
@@ -861,9 +905,11 @@ function _M:state()
     local now = ngx_now()
     local s = self.stats
 
+    -- numbers only: a foreign non-numeric value must not make the
+    -- comparisons below throw
     local function getnum(key)
-        local v, err = dict:get(key)
-        if v == nil and err and err ~= "not found" then
+        local v = dict:get(key)
+        if type(v) ~= "number" then
             return nil
         end
         return v
@@ -948,6 +994,7 @@ function _M:state()
 end
 
 -- Exposed for tests and the scheduler.
+_M.HB_TTL = HB_TTL
 _M.rate_limited_log = rate_limited_log
 _M.count_anomaly = count_anomaly
 _M.default_observation = default_observation

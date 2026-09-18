@@ -98,11 +98,12 @@ object is ever allocated per rejection.
 - `log()` is idempotent: a second call sees the released flag and returns
   without touching counters. `log()` without a matching `access()` is a
   no-op (supports mixed low-level usage in the same location).
-- Internal redirects: `ngx.ctx` survives error_page-style redirects, so a
-  second `access()` for the same limiter in the same request returns
-  `true` **without acquiring a second slot**. `ngx.exec` targets and
-  subrequests are guarded separately (`ngx.req.is_internal()`): their ctx
-  is fresh and their log phase never runs / runs only at the chain's end,
+- Re-entry within one location's phase chain: a second `access()` for
+  the same limiter in the same request sees the ctx flag and returns
+  `true` **without acquiring a second slot**. Internal redirects
+  (`error_page`, `ngx.exec`) and subrequests do **not** keep `ngx.ctx`:
+  they are guarded separately (`ngx.req.is_internal()`) — their ctx is
+  fresh and their log phase never runs / runs only at the chain's end,
   so they bypass admission by default; `allow_internal = true` re-enables
   admission for limiters that live on exec-fronted locations. A request
   is admitted at most once per limiter unless the caller clears the ctx
