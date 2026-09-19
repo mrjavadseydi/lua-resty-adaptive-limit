@@ -11,8 +11,9 @@
 --   local limiter  = assert(adaptive.new({ name = "payments",
 --       shared_dict = "adaptive_limit" }))
 --   -- init_worker_by_lua:  adaptive.start()
---   -- access_by_lua:       limiter:access()
---   -- log_by_lua:          limiter:log()
+--   -- access_by_lua:       adaptive.get("payments"):guard()
+--   -- log_by_lua:          adaptive.get("payments"):log()
+--   -- exit_worker_by_lua:  adaptive.exit()
 
 local errors = require("resty.adaptive_limit.errors")
 local limiter_mod = require("resty.adaptive_limit.limiter")
@@ -123,6 +124,14 @@ function _M.exit()
         order[i]:exit_worker()
     end
     return true
+end
+
+--- Look up a limiter registered in this worker by name. An unknown name
+-- is a programming error (a typo in an nginx block), so it raises with
+-- a clear message instead of returning nil + err.
+function _M.get(name)
+    return runtime.registry[name]
+        or error("adaptive_limit: no limiter named \"" .. tostring(name) .. "\"", 2)
 end
 
 --- Names of the limiters registered in this worker.

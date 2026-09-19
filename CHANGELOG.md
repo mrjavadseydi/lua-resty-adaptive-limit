@@ -4,6 +4,20 @@ All notable changes are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/); versioning follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `limiter:guard(opts)`: `access()` + `enforce()` in one call.
+- `adaptive.get(name)`: look up a registered limiter by name (raises on
+  an unknown name).
+- `.busted` config and `make test-unit` running a local busted when one
+  is installed; `SPEC=`/`T=` to run a single file; the harness image is
+  built on first use.
+
+### Changed
+- README reordered: quick start first, controller math left to design.md.
+  Examples use `get()`/`guard()` and no longer wrap `start()`/`exit()`.
+
 ## [0.1.0] — 2026-09-19
 
 Initial release.

@@ -8,12 +8,20 @@ API simplicity.
 
 ## Ground rules
 
-- **Run the tests.** Everything runs in the Docker harness — local runs
-  and CI are identical:
+- **Run the tests.**
   ```bash
-  make image && make test
+  make test-unit                          # specs; local busted if installed, else Docker
+  make test-unit SPEC=spec/gradient2_spec.lua
+  make test-integration T=t/admission.t   # Test::Nginx, always Docker
+  make test                               # both
+  make shell                              # tightest loop: busted / prove inside the image
   ```
-  Controller changes must additionally pass `make sim` (scenarios A–H).
+  The Docker harness (the image CI uses) is built on first use. The
+  specs are pure Lua against `spec/mock_ngx.lua`, so a local busted runs
+  them in well under a second — it must be built for LuaJIT/Lua 5.1
+  (`luarocks --lua-version=5.1 install busted`), since the code is
+  Lua 5.1 only; `.busted` sets the paths. Controller changes must
+  additionally pass `make sim` (scenarios A–H).
 - **No request-path costs without proof.** The fast path is measured in
   `benchmark/microbench.lua`. An allocation, a string concatenation, an
   extra dict operation, a regex, or a yield on the admission/release path

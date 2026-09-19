@@ -1,0 +1,7 @@
+-- busted config: lets a plain `busted` from the repo root find the
+-- library (lib/) and the ngx stub (spec/mock_ngx.lua) on a local LuaJIT.
+return {
+    _all = {
+        lpath = "./lib/?.lua;./?.lua",
+    },
+}

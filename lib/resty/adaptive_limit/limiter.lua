@@ -656,6 +656,17 @@ function _M:enforce(err)
     return http_mod.reject(self.cfg, err)
 end
 
+--- access() + enforce() in one call: admit, or emit the rejection/500
+-- response. Same opts as access(). Returns true when admitted.
+function _M:guard(opts)
+    local ok, err = self:access(opts)
+    if ok then
+        return true
+    end
+    http_mod.reject(self.cfg, err)
+    return nil, err
+end
+
 ------------------------------------------------------------------------
 -- Controller wiring (control path — called by the scheduler only)
 ------------------------------------------------------------------------

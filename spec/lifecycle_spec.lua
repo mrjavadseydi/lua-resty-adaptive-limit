@@ -259,6 +259,37 @@ describe("http.reject helper", function()
     end)
 end)
 
+describe("guard() and get()", function()
+    it("guard() admits like access() and emits nothing", function()
+        local limiter = fresh_limiter()
+        assert.True(limiter:guard())
+        assert.is_nil(ngx._last_exit)
+        assert.are.equal(1, ngx.shared.adaptive_limit
+            ._data["al:1:pay:inflight"])
+        assert.True(limiter:log())
+        assert.are.equal(0, ngx.shared.adaptive_limit
+            ._data["al:1:pay:inflight"])
+    end)
+
+    it("guard() emits the rejection response when the pool is full", function()
+        local limiter = fresh_limiter({ initial_limit = 1, max_limit = 1 })
+        assert.True(limiter:try_acquire())
+        ngx.ctx = {}
+        local ok, err = limiter:guard()
+        assert.is_nil(ok)
+        assert.are.equal(errors.REJECTED, err)
+        assert.are.equal(503, ngx._last_exit)
+        assert.are.equal("1", ngx.header["Retry-After"])
+    end)
+
+    it("get() returns the registered limiter and raises on a typo", function()
+        local limiter = fresh_limiter()
+        assert.are.equal(limiter, adaptive.get("pay"))
+        assert.error_matches(function() adaptive.get("pya") end,
+            'adaptive_limit: no limiter named "pya"', 1, true)
+    end)
+end)
+
 describe("scheduler timer management", function()
     it("reuses recurring timer across start/stop/start cycles", function()
         fresh_limiter()

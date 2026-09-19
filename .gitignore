@@ -6,7 +6,6 @@ t/*.out
 # LuaRocks / busted local artifacts
 .luarocks/
 luarocks-*.tree
-.busted
 *.luacov.output*
 
 # Benchmark scratch

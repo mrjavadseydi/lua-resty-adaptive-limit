@@ -233,6 +233,34 @@ inflight=0
 --- no_error_log
 [error]
 
+=== TEST 5c: guard() + get() — the one-line form of TEST 5
+--- http_config
+lua_package_path '/work/lib/?.lua;;';
+lua_shared_dict adaptive_limit 1m;
+init_worker_by_lua_block {
+    local adaptive = require("resty.adaptive_limit")
+    local pay = assert(adaptive.new({ name = "pay", shared_dict = "adaptive_limit",
+        initial_limit = 10, min_limit = 1, max_limit = 10 }))
+    assert(adaptive.start())
+    for i = 1, 10 do
+        assert(pay:try_acquire())
+    end
+}
+--- config
+location /t {
+    access_by_lua_block { require("resty.adaptive_limit").get("pay"):guard() }
+    content_by_lua_block { ngx.say("should not happen") }
+    log_by_lua_block { require("resty.adaptive_limit").get("pay"):log() }
+}
+--- request
+GET /t
+--- error_code: 503
+--- response_headers
+Retry-After: 1
+--- response_body_like: 503 Service
+--- no_error_log
+[error]
+
 === TEST 6: ngx.exec fronting — admission at the internal target
 -- Verified platform behavior: ngx.exec resets ngx.ctx, the target runs
 -- with ngx.req.is_internal() == true, and the log phase runs once, for

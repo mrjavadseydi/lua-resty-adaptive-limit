@@ -26,81 +26,16 @@ real-traffic reload/SIGKILL harness, and published benchmarks. It is young
 software: the failure behavior is documented honestly below, and everything
 claimed here is backed by something runnable in this repository.
 
-## Why adaptive concurrency
-
-A fixed concurrency limit is a guess. Rate limiting counts requests per
-second and says nothing about how hard each request hits the backend.
-Circuit breakers react only after failures have already happened.
-
-Concurrency is the knob that actually matches most backend capacity models
-(worker pools, connection pools, CPU-bound handlers): when offered
-concurrency exceeds what the backend can drain, queues form, latency rises,
-and beyond the knee latency and timeouts explode. Latency is therefore an
-**early** congestion signal — it starts rising as soon as the queue starts
-forming, long before failures. This library rides that signal:
-
-```text
-concurrency: 20  latency: 20 ms      healthy
-concurrency: 120 latency: 24 ms      still healthy → limit grows
-concurrency: 150 latency: 40 ms      queue forming → limit stops growing
-concurrency: 180 latency: 120 ms     saturation → limit shrinks, load shed
-```
-
-Shedding happens while the backend is degraded but alive, and admitted
-traffic keeps flowing instead of everything timing out.
-
-## How it works
-
-Two planes, strictly separated:
-
-**Fast path** (per request, in your `access_by_lua` / `log_by_lua`):
-read the current limit, take one atomic shared-dict increment — the
-admission linearization point — admit, or roll the increment back and
-reject. No locks, no queues, no network, no regex, no JSON, no logging,
-no allocation. Measured cost: **0.245 µs** per admission and **0.125 µs**
-per release (0.120 µs is the raw shared-dict floor — see
-[Performance](#performance)).
-
-For a **stable** limit `L`, more than `L` requests can never pass
-admission simultaneously (proven under real multi-worker load in
-`t/admission.t` and `t/multi_worker.t`). While the controller moves the
-limit, the limit used is up to one increment old: increases take effect on
-the next read, decreases may be transiently exceeded by admissions that
-crossed the publication point — never by more than live worker
-concurrency, and running requests are never terminated.
-
-**Control path** (timer-driven, never per request): one
-`ngx.timer.every` per worker serves all limiters. Workers flush fixed-size
-local aggregates into shared per-window accumulators with atomic
-increments. Once a window closes plus a grace period, exactly one worker —
-holding a short short-lived lease — aggregates it, runs the controller
-(Gradient2 by default), and publishes the new integer limit. Windows with
-insufficient samples **hold** the limit; nothing moves on idle.
-
-### The controller (Gradient2)
-
-Per closed window, with the smoothed observed RTT (`short`), the slow
-baseline (`long`), and the strong-signal ratio (overload + timeout +
-connect failures):
-
-```text
-short  = sample_alpha  * mean_rtt + (1 - sample_alpha)  * short
-long   = baseline_alpha * short  + (1 - baseline_alpha) * long
-         -- frozen on windows above the strong-signal ratio threshold:
-         -- an overload must never be normalized into the baseline
-
-gradient  = clamp(rtt_tolerance * long / short, min_gradient, 1.0)
-headroom  = clamp(sqrt(limit), headroom_min, headroom_max)
-candidate = limit * gradient + headroom
-candidate = min(candidate, limit * overload_backoff)   -- on overload windows
-limit     = clamp(limit*(1-smoothing) + candidate*smoothing, min_limit, max_limit)
-```
-
-An AIMD controller (additive increase / multiplicative decrease) ships as a
-simpler reference. Both are pure, deterministic, `ngx`-free modules
-unit-tested with hand-computed values and fuzzed for the invariants in
-[design.md](design.md); the scenarios A–H from the design process run as
-simulations in `spec/simulation_spec.lua`.
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [API](#api)
+- [Configuration reference](#configuration-reference)
+- [Failure behavior](#failure-behavior)
+- [Performance](#performance)
+- [Limitations](#limitations)
+- [Security considerations](#security-considerations)
+- [Development](#development)
 
 ## Installation
 
@@ -116,80 +51,79 @@ into your `lua_package_path`.
 
 ## Quick start
 
+Three things: a dedicated shared dict, a module that defines your
+limiters, and five one-line Lua blocks.
+
 ```nginx
-lua_shared_dict adaptive_limit 10m;   # dedicated zone; sizing in README
+lua_shared_dict adaptive_limit 10m;   # dedicated zone; sizing below
 
-init_by_lua_block {
-    require("app.limiters")           -- early validation of your definitions
-}
-
-init_worker_by_lua_block {
-    local limiters = require("app.limiters")
-    local ok, err = limiters.start()
-    if not ok then
-        ngx.log(ngx.ERR, "adaptive_limit failed to start: ", err)
-    end
-}
-
-exit_worker_by_lua_block {
-    require("app.limiters").exit()    -- reconcile slots on shutdown/reload
-}
+init_by_lua_block        { require("app.limiters") }   -- validate at startup
+init_worker_by_lua_block { assert(require("resty.adaptive_limit").start()) }
+exit_worker_by_lua_block { require("resty.adaptive_limit").exit() }
 
 server {
     location /api/ {
-        access_by_lua_block {
-            local limiters = require("app.limiters")
-            local ok, err = limiters.payments:access()
-            if not ok then
-                if err == "rejected" then
-                    return limiters.payments:enforce(err)  -- 503 + Retry-After
-                end
-                return ngx.exit(500)
-            end
-        }
-
+        access_by_lua_block { require("resty.adaptive_limit").get("payments"):guard() }
         proxy_pass http://payments_backend;
-
-        log_by_lua_block {
-            -- release FIRST: other log-phase work must not be able to
-            -- prevent the slot from being returned
-            require("app.limiters").payments:log()
-        }
+        log_by_lua_block    { require("resty.adaptive_limit").get("payments"):log() }
     }
 }
 ```
 
-`app.limiters` (see [examples/basic.lua](examples/basic.lua)):
+`app/limiters.lua` ([examples/basic.lua](examples/basic.lua)):
 
 ```lua
 local adaptive = require "resty.adaptive_limit"
 
-local M = {}
-
-M.payments = assert(adaptive.new({
-    name         = "payments",        -- required
-    shared_dict  = "adaptive_limit",  -- required
-
-    algorithm    = "gradient2",       -- or "aimd"
-
+assert(adaptive.new({
+    name          = "payments",        -- required
+    shared_dict   = "adaptive_limit",  -- required
     initial_limit = 50,
     min_limit     = 5,
     max_limit     = 2000,
-
-    sample_window = 1.0,
-    min_samples   = 20,
-
-    failure_mode  = "fail_open",
 }))
-
-function M.start() return adaptive.start() end
-function M.exit()  return adaptive.exit()  end
-
-return M
 ```
+
+`guard()` admits the request or answers `503` + `Retry-After` (500 on a
+limiter-internal error); `log()` releases the slot and records the
+observation. Call `log()` before any other `log_by_lua` work in the same
+location. Everything else is tuning, and the defaults are the `balanced`
+profile.
 
 A runnable end-to-end config lives in [examples/nginx.conf](examples/nginx.conf);
 [examples/proxy.lua](examples/proxy.lua) shows the low-level API.
+
+## How it works
+
+A fixed concurrency limit is a guess; rate limits count requests and say
+nothing about how hard each one hits the backend. Latency starts rising
+as soon as a queue starts forming — long before failures — so it is the
+earliest congestion signal there is:
+
+```text
+concurrency: 20  latency: 20 ms      healthy
+concurrency: 120 latency: 24 ms      still healthy → limit grows
+concurrency: 150 latency: 40 ms      queue forming → limit stops growing
+concurrency: 180 latency: 120 ms     saturation → limit shrinks, load shed
+```
+
+Two planes, strictly separated:
+
+**Fast path** (per request): read the current limit, take one atomic
+shared-dict increment — the admission linearization point — admit, or
+roll the increment back and reject. No locks, no queues, no regex, no
+JSON, no logging, no allocation: **0.245 µs** per admission, **0.125 µs**
+per release ([Performance](#performance)). For a stable limit `L`, more
+than `L` requests can never pass admission simultaneously (proven under
+real multi-worker load in `t/admission.t` and `t/multi_worker.t`).
+
+**Control path** (one timer per worker, never per request): workers flush
+fixed-size local aggregates into shared per-window accumulators; once a
+window closes, exactly one worker aggregates it, runs the controller
+(Gradient2 by default, AIMD as a reference) and publishes the new limit.
+Windows with insufficient samples hold the limit; nothing moves on idle.
+The controller math, the invariants and their proofs are in
+[design.md §8](design.md).
 
 ## API
 
@@ -283,6 +217,13 @@ signal), everything else → success. Override with
 `outcome_classifier = function(status) return "overload" or nil end`
 (pcall-protected; errors fall back to the default).
 
+### `limiter:guard(options) -> true | nil, err`
+
+`access(options)` followed by `enforce(err)` on failure: admits, or
+produces the rejection response and returns `nil, err`. The one-liner
+for the common case; use `access()` + `enforce()` to choose the response
+yourself.
+
 ### `limiter:enforce(err)`
 
 Convenience helper for producing the standard rejection response:
@@ -316,6 +257,12 @@ and starts the single scheduler timer. `options.flush_interval` (default
 from the shared counter: graceful shutdown and reload drains cannot leak
 them. If a straggler log phase still fires afterwards, its release floors
 the counter at zero and raises an anomaly — visible, never corrupting.
+
+### `adaptive.get(name) -> limiter`
+
+The limiter registered under `name` in this worker. An unknown name is a
+configuration typo, so it **raises** with a clear message rather than
+returning `nil`.
 
 ### `adaptive.limiters()`, `adaptive.stop()`, `adaptive.errors`
 
@@ -485,14 +432,17 @@ dict as sensitive-only-in-summary; no request payloads are ever stored.
 ## Development
 
 ```bash
-make image          # build the test/bench harness (OpenResty + busted +
-                    # Test::Nginx + wrk) — the same image CI uses
-make test           # busted specs + Test::Nginx integration tests
-make sim            # deterministic controller simulations A–H
-make bench          # benchmark matrix + micro-bench
-make resilience     # reload/SIGKILL under real wrk traffic
-SOAK_SECONDS=600 make soak   # memory/timer/GC stability soak
+make test-unit                          # busted specs (local busted if installed, else Docker)
+make test-unit SPEC=spec/gradient2_spec.lua
+make test-integration T=t/admission.t   # Test::Nginx (always Docker)
+make test                               # both
+make sim                                # deterministic controller simulations A–H
+make shell                              # a shell inside the harness image
+make bench / make resilience / SOAK_SECONDS=600 make soak
 ```
+
+The harness image (OpenResty + busted + Test::Nginx + wrk, the same one
+CI uses) is built on first use. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The ten invariants in [design.md](design.md) each map to a test or a
 simulated property; the verification matrix at the end of design.md lists
