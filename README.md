@@ -20,11 +20,10 @@ allow / reject            latency + outcome observations
 upstream
 ```
 
-Status: **0.1.0** — feature-complete against [design.md](design.md), with
+Status: **0.1.0** — initial release, with
 multi-worker race tests, deterministic controller simulations, a
 real-traffic reload/SIGKILL harness, and published benchmarks. It is young
-software: the failure behavior is documented honestly below, and everything
-claimed here is backed by something runnable in this repository.
+software; read the failure behavior and limitations before deploying it.
 
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -42,9 +41,7 @@ claimed here is backed by something runnable in this repository.
 OpenResty ≥ **1.15.8.1** (the library uses `exit_worker_by_lua*`,
 available since lua-nginx-module 0.10.15). No other runtime dependencies.
 
-```bash
-luarocks install lua-resty-adaptive-limit
-```
+After a LuaRocks release: `luarocks install lua-resty-adaptive-limit`.
 
 Or copy `lib/resty/adaptive_limit.lua` and `lib/resty/adaptive_limit/`
 into your `lua_package_path`.
@@ -120,9 +117,13 @@ real multi-worker load in `t/admission.t` and `t/multi_worker.t`).
 **Control path** (one timer per worker, never per request): workers flush
 fixed-size local aggregates into shared per-window accumulators; once a
 window closes, exactly one worker aggregates it, runs the controller
-(Gradient2 by default, AIMD as a reference) and publishes the new limit.
-Windows with insufficient samples hold the limit; nothing moves on idle.
-The controller math, the invariants and their proofs are in
+(a windowed Gradient2-inspired algorithm by default, AIMD as a reference)
+and publishes the new limit.
+Windows with insufficient latency samples hold unless explicit failures
+independently justify backoff; nothing moves on idle.
+Healthy windows grow only after a rejection proves offered demand reached
+the current cap, preventing low-concurrency traffic from drifting the limit
+upward. The controller math and invariants are in
 [design.md §8](design.md).
 
 ## API
@@ -207,8 +208,8 @@ the log phase still runs and the slot is still released.
 Latency source (`latency_source`): `request_time` (default,
 `ngx.now() - ngx.req.start_time()`), `upstream_response_time` (parsed
 explicitly — upstream retries produce compound values like
-`"0.005, 0.010"`; `tonumber()` on those silently produces garbage, so the
-parser validates every token and applies `upstream_time_choice`
+`"0.005, 0.010"`; redirects across upstream groups also introduce colons.
+The parser validates every token and applies `upstream_time_choice`
 `last`/`max`/`sum`), or `manual` (low-level `release` only).
 
 Outcome classification defaults: `499` → aborted, `503` → overload,
@@ -284,7 +285,7 @@ Explicit options override `profile`; profiles are only pre-tuned bundles
 | `min_limit` / `max_limit` | integer | 1 / 2000 | `≥ 1`; hard clamps on every publication |
 | `sample_window` | number | 1.0 | seconds; controller window |
 | `aggregation_grace` | number | 0.35 | seconds; wait after window close before processing (late flushes) |
-| `min_samples` | integer | 20 | below this: hold the limit, move nothing |
+| `min_samples` | integer | 20 | minimum usable latency samples for an RTT update |
 | `failure_mode` | string | `"fail_open"` | lifecycle behavior on limiter-internal failures |
 | `rtt_tolerance` | number | 2.0 | `> 1`; tolerated short/long RTT ratio before shedding |
 | `min_gradient` | number | 0.5 | `(0, 1)`; floor on per-window decrease |
@@ -292,9 +293,9 @@ Explicit options override `profile`; profiles are only pre-tuned bundles
 | `headroom_min`/`headroom_max` | number | 1 / 50 | bounds of the `sqrt(limit)` growth pressure |
 | `baseline_alpha` | number | 0.05 | `(0, 1)`; baseline EWMA speed (slow by design) |
 | `sample_alpha` | number | 0.5 | `(0, 1]`; observed-RTT EWMA speed |
-| `overload.min_samples` | integer | 20 | gate before backoff may trigger |
-| `overload.failure_ratio` | number | 0.10 | `(0, 1]`; strong-signal ratio that triggers backoff and freezes the baseline |
-| `overload.backoff` | number | 0.80 | `(0, 1)`; multiplicative backoff |
+| `overload_min_samples` | integer | 20 | minimum completed outcomes before explicit-signal backoff may trigger |
+| `overload_failure_ratio` | number | 0.10 | `(0, 1]`; strong-signal/completion ratio that triggers backoff and freezes the baseline |
+| `overload_backoff` | number | 0.80 | `(0, 1)`; multiplicative backoff |
 | `latency_source` | string | `"request_time"` | \| `upstream_response_time` \| `manual` |
 | `upstream_time_choice` | string | `"last"` | `last` \| `max` \| `sum` for multi-attempt upstream timings |
 | `allow_internal` | boolean | false | admit on `ngx.req.is_internal()` (exec-fronted locations) |
@@ -302,10 +303,11 @@ Explicit options override `profile`; profiles are only pre-tuned bundles
 | `stale_threshold` | number | 30 | seconds without completions before `controller_stalled` |
 | `on_update` | function | nil | `function(snapshot)` after each controller publication (control path; must not yield) |
 | `on_anomaly` | function | nil | `function(kind, detail)` on anomalies/internal errors |
+| `outcome_classifier` | function | nil | `function(status) -> outcome or nil`; errors use the default classifier |
 
 ### Shared dict sizing
 
-Per limiter: ~10 permanent keys + up to ~3 live windows × 8 accumulator
+Per limiter: ~10 permanent keys + up to ~3 live windows × 9 accumulator
 keys (TTL-bounded) + one heartbeat key per worker. All entries are small
 numbers/short strings; a limiter idles well under 2 KB. A 10m zone serves
 dozens of limiters comfortably. `state().shared_dict_free` exposes usage —
@@ -314,8 +316,6 @@ evicted/undersized the limiter re-seeds from the last observed value and
 raises `limit_missing` anomalies rather than admitting unbounded.
 
 ## Failure behavior
-
-Documented honestly, with the reasoning:
 
 * **Pool full** is not a failure: `rejected` is the limiter working.
 * **Shared-dict failures** on the request path surface as
@@ -336,13 +336,12 @@ Documented honestly, with the reasoning:
   Late log phases are safe (counter floors at zero, anomaly counted).
 * **Worker death (SIGKILL/segfault)**: nothing runs. The victim's held
   slots leak — the shared counter stays high, reducing capacity until an
-  operator acts. This is a **documented limitation**, not something the
-  library preaches away: an unsynchronized "repair" while live requests
+  operator acts. An unsynchronized "repair" while live requests
   modify the counter would corrupt it. It is surfaced (heartbeat expiry,
   `controller_stalled`, inflight/throughput divergence) and the operator
   procedure is: quiesce or accept the shedding, then reset `inflight` via
   an admin snippet. A lease/quota backend that auto-recovers is a
-  separate, benchmarked feature — not smuggled into this path.
+  separate feature and is not part of this release.
 * **Hung backend** (all in-flight requests stuck): a completion-based
   controller sees no samples, so the limit **holds** — backpressure
   remains, the limiter keeps shedding at the last healthy limit, and
@@ -355,7 +354,7 @@ Documented honestly, with the reasoning:
 Measured with the harness in `benchmark/` (wrk 4.2.0, 2 threads / 64
 connections, median of 3x15 s, Docker VM: linuxkit aarch64 reporting 1
 core, 978 MiB, OpenResty 1.31.1.1 -- see `benchmark/results/*/machine.txt`).
-Two honesty notes before the table: on a single-core VM wrk's two threads
+Two caveats: on a single-core VM wrk's two threads
 compete with nginx for CPU (absolute numbers are depressed and non-monotone
 in worker count), and every comparison below is against an identical
 no-limiter baseline run on the same VM. Treat relative deltas as the claim.
@@ -374,8 +373,9 @@ Below-limit throughput (limiter enabled, never rejecting -- median req/s):
 The irreducible cost is the shared-dict admission itself (the fixed
 counter, the `resty.limit.conn` shape); the full adaptive stack -- worker
 statistics, log-phase observation, window flushing, controller -- adds
-**1-2%** on top of that floor, and the scheduler serving 16 limiters is
-indistinguishable from noise. Under heavy rejection (limit 2 under 64
+roughly **0-2%** on top of that floor in this run. The 16-limiter results
+show the scheduler remains small relative to request processing, but this
+single-host benchmark is too noisy for a stronger claim. Under heavy rejection (limit 2 under 64
 connections) the limiter serves ~41-46k req/s -- the 503 short-circuit is
 cheaper than proxying, which is the point of early load shedding.
 
@@ -408,14 +408,15 @@ raw per-repetition outputs, including noisy runs, are kept under
 * **Request-scoped work.** WebSockets, SSE, gRPC streaming, and
   multi-hour uploads don't fit a completion-based model: `bypass` them
   and manage admission explicitly with the low-level API.
-* **Low traffic.** Below `min_samples` per window the limit holds; a
-  service seeing 2 req/s learns almost nothing (by design).
+* **Low traffic.** Below `min_samples` usable latency samples per window the
+  limit holds unless explicit failures trigger backoff; a healthy service
+  seeing 2 req/s learns almost nothing.
 * **Abrupt worker death** leaks that worker's slots (see above).
 * **Wrong latency sources give wrong limits.** `request_time` includes
   slow clients and large bodies; prefer `upstream_response_time` when the
   protected resource is backend processing.
-* **Config changes** take effect on reload; the learned limit persists,
-  but a lowered `max_limit` only binds at the next publication.
+* **Config changes** take effect on reload; the learned limit persists and
+  is immediately clamped to a changed `min_limit`/`max_limit` range.
 * `log_by_lua` does not run for subrequests (platform behavior); the
   lifecycle helper relies on the documented redirect semantics pinned in
   `t/lifecycle.t`.
@@ -445,8 +446,7 @@ The harness image (OpenResty + busted + Test::Nginx + wrk, the same one
 CI uses) is built on first use. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The ten invariants in [design.md](design.md) each map to a test or a
-simulated property; the verification matrix at the end of design.md lists
-where each is proven.
+simulated property; the verification matrix lists the relevant checks.
 
 ## License
 

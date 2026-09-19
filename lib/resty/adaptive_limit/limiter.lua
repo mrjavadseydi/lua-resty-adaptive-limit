@@ -424,7 +424,7 @@ function _M:release(latency, outcome)
         if outcome ~= "aborted" then
             -- Client aborts release the slot but their (truncated)
             -- duration is not a capacity signal; malformed latency is
-            -- dropped by sanitize_latency so mean_rtt stays honest.
+            -- dropped by sanitize_latency so mean_rtt remains valid.
             local latency_n = sanitize_latency(self, latency)
             if latency_n then
                 s.sample_count = s.sample_count + 1
@@ -795,6 +795,7 @@ function _M:control_window(n, now)
         connect_error_count = acc.cer,
         error_count = acc.err,
         aborted_count = acc.abt,
+        rejected_count = acc.rej,
         completions = acc.cmp,
     }
 

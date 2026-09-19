@@ -2,7 +2,8 @@
 -- $upstream_header_time, $upstream_connect_time).
 --
 -- With upstream retries these variables hold multiple values separated
--- by commas and/or spaces, e.g. "0.005, 0.010" or "0.005 , 0.010";
+-- by commas, colons and/or spaces, e.g. "0.005, 0.010". Colons separate
+-- attempts made by different upstream groups after an internal redirect.
 -- "-" means that attempt produced no timing (e.g. connect failure).
 -- Calling tonumber() on the raw value would either yield nil or, worse,
 -- silently parse only the first token depending on LuaJIT's conversion
@@ -15,7 +16,7 @@
 --
 -- Any token that is not a finite non-negative number makes the whole
 -- value unusable: the parser returns nil and no observation is recorded.
--- An honest absence of data beats a wrong number.
+-- Missing data is preferable to a wrong number.
 
 local tonumber = tonumber
 local math_huge = math.huge
@@ -32,7 +33,7 @@ function _M.parse(raw, choice)
     local last_v
     local count = 0
 
-    for token in raw:gmatch("[^,%s]+") do
+    for token in raw:gmatch("[^,:%s]+") do
         local v = tonumber(token)
         if v == nil or v ~= v or v < 0 or v == math_huge then
             return nil

@@ -132,7 +132,7 @@ with a descriptive error — never silently accepted.
 | `max_limit` | number | 2000 | `>= min_limit` |
 | `sample_window` | number | 1.0 | controller window seconds; `> 0` |
 | `aggregation_grace` | number | 0.35 | seconds after window close before it is processed |
-| `min_samples` | number | 20 | below this many completions in a window: hold limit |
+| `min_samples` | number | 20 | minimum usable latency samples for an RTT update |
 | `failure_mode` | string | `"fail_open"` | or `"fail_closed"`, see §9 |
 | `rtt_tolerance` | number | 2.0 | tolerated short/long RTT ratio before shedding (gradient2) |
 | `min_gradient` | number | 0.5 | lower clamp of the gradient (gradient2) |
@@ -140,17 +140,18 @@ with a descriptive error — never silently accepted.
 | `headroom_min` / `headroom_max` | number | 1 / 50 | bounds on the `sqrt(limit)` headroom |
 | `baseline_alpha` | number | 0.05 | long-RTT (baseline) EWMA speed, `(0, 1)` |
 | `sample_alpha` | number | 0.5 | short-RTT EWMA speed, `(0, 1]` |
-| `overload.min_samples` | number | 20 | minimum completions before backoff may trigger |
-| `overload.failure_ratio` | number | 0.10 | strong-signal ratio that triggers backoff |
-| `overload.backoff` | number | 0.80 | multiplicative backoff, `(0, 1)` |
+| `overload_min_samples` | number | 20 | minimum completed outcomes before explicit-signal backoff may trigger |
+| `overload_failure_ratio` | number | 0.10 | strong-signal/completion ratio that triggers backoff |
+| `overload_backoff` | number | 0.80 | multiplicative backoff, `(0, 1)` |
 | `latency_source` | string | `"request_time"` | `"request_time"` \| `"upstream_response_time"` \| `"manual"` |
 | `upstream_time_choice` | string | `"last"` | when retries produced several upstream timings: `"last"` \| `"max"` \| `"sum"` |
 | `rejection_status` | number | 503 | used only by `enforce()` |
-| `retry_after` | string/number | 1 | used only by `enforce()` |
+| `retry_after` | number | 1 | non-negative seconds; used only by `enforce()` |
 | `stale_threshold` | number | 30 | seconds without completions before `controller_stalled` is reported |
 | `on_update` | function | nil | `function(snapshot)` after each controller publication (held windows fire nothing) |
 | `allow_internal` | boolean | false | admit on internal requests (exec-fronted locations; see §2) |
 | `on_anomaly` | function | nil | `function(kind, detail)` for counter anomalies / internal errors |
+| `outcome_classifier` | function | nil | `function(status) -> outcome or nil`; errors use the default classifier |
 
 Profiles (tuned via simulation, see `spec/simulation_spec.lua`):
 `conservative` = lower `rtt_tolerance`, stronger smoothing, earlier backoff;
@@ -179,7 +180,7 @@ incompatible shared state is a loud startup error.
 | `...:last_window` | number | controller | permanent |
 | `...:last_update` | number | controller | permanent |
 | `...:w:<n>:c` / `:s` | number | worker flush (atomic incr) | exptime + explicit delete |
-| `...:w:<n>:ovl` / `:tmo` / `:cer` / `:err` / `:abt` / `:rej` | number | worker flush (atomic incr) | exptime + explicit delete |
+| `...:w:<n>:ovl` / `:tmo` / `:cer` / `:err` / `:abt` / `:rej` / `:cmp` | number | worker flush (atomic incr) | exptime + explicit delete |
 | `...:lease:<n>` | string `"<pid>:<seq>"` | lease contender (add) | TTL (`lease_ttl`) |
 | `...:hb:<worker_id>` | number (timestamp) | scheduler heartbeat | TTL 5s |
 
@@ -191,7 +192,7 @@ Invariants of the shared model:
 - Worker heartbeat slots are indexed by `ngx.worker.id()`, bounded by
   `ngx.worker.count()`; an expired heartbeat identifies a lost worker.
 - The schema marker identifies the shared state; a version mismatch at
-  `init_worker` reinitializes state with a WARN rather than interpreting
+  `init_worker` is a hard startup error rather than interpreting or deleting
   foreign data.
 - No JSON, no blobs, no Lua-serialized tables: every shared value is a
   number or short string, parseable by any tool.
@@ -255,8 +256,8 @@ Each limiter keeps, in plain module-local Lua state per worker:
   `sample_count, latency_sum, success, timeout, connect_error, overload,
   error, aborted, rejected, admitted_total, rejected_total, last_completion`
 - Rate-limited log state (max one message per kind per second per worker).
-- Anomaly counters: `internal_errors, counter_anomalies, timer_failures,
-  dict_read_failures, workers_lost, controller_skips`.
+- Anomaly counters: `internal_errors`, per-kind `counter_anomalies`,
+  `timer_failures`, and `controller_skips`.
 
 ## 7. Statistics pipeline
 
@@ -276,10 +277,10 @@ controller lease holder aggregates window N-1, computes, publishes
 - The controller reads a window only after it is closed *and* the grace
   period passed, so straggler flushes are accounted for. After processing,
   the accumulator keys are deleted explicitly (exptime is the backstop).
-- Windows with `sample_count < min_samples` (or zero samples) **hold** the
-  current limit. Low-traffic services do not oscillate; idle periods change
-  nothing (no manufactured samples, no baseline reset, no drift toward
-  min/max). `last_window` advances so the backlog is not reprocessed later.
+- Windows with `sample_count < min_samples` hold unless enough explicit
+  failures independently trigger backoff. Idle periods change nothing (no
+  manufactured samples, no baseline reset, no drift toward min/max).
+  `last_window` advances so the backlog is not reprocessed later.
 - After a long pause (e.g. laptop sleep, SIGSTOP), the controller processes
   at most the two most recent closed windows and skips older ones
   (`controller_skips` counter), so a timer backlog cannot cause a burst of
@@ -291,55 +292,57 @@ controller lease holder aggregates window N-1, computes, publishes
 
 ```lua
 local g2 = require "resty.adaptive_limit.controller.gradient2"
+local common = require "resty.adaptive_limit.controller.common"
 local state = { limit = 100.0, long_rtt = 0.020, short_rtt = 0.020 }
 local m = { sample_count = 900, mean_rtt = 0.024,
             overload_count = 2, timeout_count = 0, error_count = 1,
             aborted_count = 0 }
-local next_state, err = g2:update(state, m, config)
+local next_state, err = common.safe_update(g2, state, m, config)
 ```
 
 Algorithms never touch `ngx`, shared dicts, or I/O; all inputs are
 validated numbers. They are unit-tested with hand-computed values and fuzzed
-for the §54 properties (finite, positive, bounded, no movement on empty
+for the controller properties (finite, positive, bounded, no movement on empty
 input, corrupted input cannot corrupt state).
 
-### Gradient2 (default)
+### Gradient2-inspired controller (`gradient2`, default)
+
+This is a window-aggregated adaptation, not a line-for-line port of
+[Netflix's Gradient2Limit](https://github.com/Netflix/concurrency-limits/blob/master/concurrency-limits-core/src/main/java/com/netflix/concurrency/limits/limit/Gradient2Limit.java).
+It uses rejection evidence as the app-limited guard because OpenResty workers
+publish aggregate windows rather than a single per-sample inflight value.
 
 Given window measurement `m` and current state:
 
-1. If `m.sample_count < min_samples` → hold (no update at all).
-2. `short_rtt' = sample_alpha * m.mean_rtt + (1 - sample_alpha) * short_rtt`
-3. Baseline update is **frozen during overload episodes**: if the
-   strong-signal ratio `(overload + timeout + connect_error) /
-   sample_count > overload.failure_ratio`, `long_rtt` is not updated
-   this window (an overload must not be normalized into the baseline;
-   application errors such as HTTP 500 are *not* strong signals and do
-   not freeze it). Otherwise
-   `long_rtt' = baseline_alpha * short_rtt' + (1 - baseline_alpha) * long_rtt`.
-4. `gradient = clamp(rtt_tolerance * long_rtt' / short_rtt', min_gradient, 1.0)`
-   (guard: `short_rtt' <= 0` → hold).
-5. `headroom = clamp(sqrt(limit), headroom_min, headroom_max)` — bounded
-   upward pressure so a healthy backend can keep growing; growth is
-   ~`smoothing * sqrt(limit)` per window, never a jump.
-6. `candidate = limit * gradient + headroom`
-7. Overload backoff: if `sample_count >= overload.min_samples` and the
-   strong-signal ratio exceeds `overload.failure_ratio`:
-   `candidate = min(candidate, limit * overload.backoff)`.
-8. `limit' = clamp(limit * (1 - smoothing) + candidate * smoothing,
+1. Compute the strong-signal ratio `(overload + timeout + connect_error) /
+   completions`. If it exceeds `overload_failure_ratio` with at least
+   `overload_min_samples` completions, explicit-signal backoff may run even
+   when no usable latency sample exists.
+2. If `m.sample_count < min_samples` and explicit backoff did not trigger →
+   hold (no update at all).
+3. `short_rtt' = sample_alpha * m.mean_rtt + (1 - sample_alpha) * short_rtt`
+4. Freeze `long_rtt` whenever the strong-signal ratio exceeds the threshold;
+   otherwise update it from `short_rtt'`. Application errors such as HTTP 500
+   are not strong signals.
+5. `gradient = clamp(rtt_tolerance * long_rtt' / short_rtt', min_gradient, 1.0)`
+6. If the window contains a rejection, offered demand reached the cap:
+   `headroom = clamp(sqrt(limit), headroom_min, headroom_max)`. Otherwise
+   `headroom = 0`, preventing app-limited traffic from causing growth.
+7. `candidate = limit * gradient + headroom`
+8. On explicit overload: `candidate = min(candidate, limit * overload_backoff)`.
+9. `limit' = clamp(limit * (1 - smoothing) + candidate * smoothing,
    min_limit, max_limit)`
-9. Publish `floor(limit')` (integer at the publication boundary; the float
-   state is kept internally for smooth EWMA).
-10. Any non-finite intermediate (NaN/inf from corrupted inputs) → hold the
-    previous valid limit, count `internal_errors`, rate-limited error log.
-    NaN/inf are never published.
+10. Publish `floor(limit')`; retain the float state for subsequent updates.
+11. Any invalid or non-finite result holds or repairs the previous state,
+    increments `internal_errors`, and emits a rate-limited error log.
 
 ### AIMD (reference)
 
-Healthy window (strong-signal ratio ≤ threshold **and**
-`mean_rtt <= rtt_tolerance * long_rtt`): `limit += additive_increment`
-(default 1). Congested window: `limit *= multiplicative_decrease`
-(default 0.8). Same sample/baseline handling, clamps, publish and safety
-rules as Gradient2.
+A healthy window with at least one rejection adds `aimd_increment` (default
+1); an app-limited healthy window holds. Latency congestion or a strong-signal
+window with at least `overload_min_samples` completions multiplies by
+`aimd_decrease` (default 0.8). Explicit failures can therefore shed without a
+latency sample. AIMD uses the same baseline, clamp, and safety rules.
 
 ### Publication
 
@@ -374,9 +377,8 @@ operations, executed by at most one worker, once per `sample_window`.
   `t/resilience.t` and `benchmark/resilience.sh`); reconciliation is coded to be safe under both orderings.
 - **Abrupt death (SIGKILL / segfault)**: nothing runs; the victim's slots
   leak — the shared counter stays high, permanently reducing effective
-  capacity until an operator acts. This is stated honestly rather than
-  papered over:
-  - the worker's heartbeat key expires → `workers_lost` counter;
+  capacity until an operator acts:
+  - the worker's heartbeat key expires → `workers_active` drops;
   - `inflight >= limit` combined with no completions for
     `stale_threshold` seconds → `controller_stalled` in `state()`;
   - no automatic reset ever runs (an unsynchronized "repair" while live
@@ -451,9 +453,9 @@ self-heal immediately as old workers finish draining.
   surfaces `controller_stalled` for alerting.
 - Abrupt worker death leaks that worker's slots (§9) — surfaced, not hidden.
 - Shared-dict sizing guidance (README): ≈50 small entries per limiter
-  plus ≤ 3 live windows × 7 accumulator keys and `worker_count` heartbeat
+  plus ≤ 3 live windows × 9 accumulator keys and `worker_count` heartbeat
   slots; a 10m zone comfortably serves dozens of limiters. `state()`
-  exposes `dict_capacity`/`dict_free` for monitoring.
+  exposes `shared_dict_capacity`/`shared_dict_free` for monitoring.
 
 ## 13. Invariants (and where they are enforced)
 
@@ -463,9 +465,9 @@ self-heal immediately as old workers finish draining.
 | 2 | Every admitted request releases exactly once | ctx released-flag; rollback on reject; `t/lifecycle.t` |
 | 3 | A rejected request cannot permanently raise inflight | unconditional rollback; negative-snap anomaly; `t/admission.t` |
 | 4 | `min_limit <= published limit <= max_limit` | clamp at publication; fuzz spec |
-| 5 | Insufficient samples ⇒ no limit movement | hold rule in both controllers; `t/controller.t`, simulations F/G |
+| 5 | Low-sample healthy windows hold; explicit failures may back off | controller gates; unit specs and simulations F/G |
 | 6 | Controller state never NaN/inf | input/output validation; hold-on-invalid; fuzz spec |
-| 7 | No request-path external I/O or yielding | construction (only dict get/incr + fixed-size math); code review §76 |
+| 7 | No request-path external I/O or yielding | construction (only dict get/incr + fixed-size math); admission integration tests |
 | 8 | Memory does not grow with total requests | fixed-size structs; TTL'd window keys; soak test |
 | 9 | Controller failure never silently maximizes the limit | hold-on-invalid + clamp; internal_errors counter |
 | 10 | Observability failures never prevent release | release-before-observe ordering (§2); pcall-protected extras |
@@ -475,8 +477,8 @@ self-heal immediately as old workers finish draining.
 | Concern | Method |
 |---|---|
 | Algorithm math (hand-computed values, edge inputs) | busted `spec/*_spec.lua` |
-| §54 properties under generated inputs | busted fuzz specs (seeded PRNG) |
-| §53 scenarios A–H | deterministic simulations (`spec/simulation_spec.lua`) |
+| Controller properties under generated inputs | busted fuzz specs (seeded PRNG) |
+| Scenarios A–H | deterministic simulations (`spec/simulation_spec.lua`) |
 | Admission races, multi-worker caps | Test::Nginx `t/admission.t`, `t/multi_worker.t` (1/2/4 workers, 100 concurrent vs limit 10, thousands of reps) |
 | Lifecycle (§52 list) | `t/lifecycle.t` |
 | Reload under traffic | `t/resilience.t`, `benchmark/resilience.sh` (HUP × N while wrk drives requests) |

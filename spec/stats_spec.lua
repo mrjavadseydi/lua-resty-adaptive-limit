@@ -124,7 +124,8 @@ describe("strong-signal classification (controllers)", function()
         }
         local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
         local m = { sample_count = 100, mean_rtt = 0.020,
-            connect_error_count = 20 } -- ratio 0.2 > 0.10
+            connect_error_count = 20, completions = 100,
+            rejected_count = 1 } -- ratio 0.2 > 0.10
         local next_state = assert(common.safe_update(g2, state, m, cfg))
         -- backoff: candidate = min(110, 80) = 80 -> limit 90
         assert.are.equal(90.0, next_state.limit)
@@ -143,7 +144,8 @@ describe("strong-signal classification (controllers)", function()
             overload_failure_ratio = 0.10, overload_backoff = 0.80,
         }
         local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
-        local m = { sample_count = 100, mean_rtt = 0.020, error_count = 50 }
+        local m = { sample_count = 100, mean_rtt = 0.020, error_count = 50,
+            completions = 100, rejected_count = 1 }
         local next_state = assert(common.safe_update(g2, state, m, cfg))
         -- no backoff: the healthy-window candidate wins -> 105. (The
         -- baseline-freeze behavior itself is covered by the backoff

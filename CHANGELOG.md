@@ -6,28 +6,14 @@ All notable changes are documented here. Format based on
 
 ## [Unreleased]
 
-### Added
-- `limiter:guard(opts)`: `access()` + `enforce()` in one call.
-- `adaptive.get(name)`: look up a registered limiter by name (raises on
-  an unknown name).
-- `.busted` config and `make test-unit` running a local busted when one
-  is installed; `SPEC=`/`T=` to run a single file; the harness image is
-  built on first use.
-
-### Changed
-- README reordered: quick start first, controller math left to design.md.
-  Examples use `get()`/`guard()` and no longer wrap `start()`/`exit()`.
-
-## [0.1.0] — 2026-09-19
-
-Initial release.
+## [0.1.0] — 2026-09-20
 
 ### Added
 - Adaptive concurrency admission on top of atomic `lua_shared_dict`
-  operations: `try_acquire`/`release` (low-level) and `access`/`log`
+  operations: `try_acquire`/`release` (low-level), `access`/`log`, and `guard`
   (request-lifecycle) APIs with idempotent release and internal-redirect
   safety.
-- Gradient2 adaptive controller (default) and AIMD reference controller,
+- Windowed Gradient2-inspired controller (default) and AIMD reference controller,
   both pure and deterministic, with hand-computed unit tests, seeded fuzz
   property tests, and scenario A–H simulations.
 - Per-worker scheduler (single `ngx.timer.every`), fixed-size worker-local
@@ -46,3 +32,5 @@ Initial release.
   errors, stats, controller loop, resilience); Docker harness identical
   to CI; benchmark matrix, micro-benchmark, soak and reload/SIGKILL
   harnesses.
+- Named limiter lookup through `adaptive.get(name)` and local test selection
+  through the `SPEC=`/`T=` Make variables.

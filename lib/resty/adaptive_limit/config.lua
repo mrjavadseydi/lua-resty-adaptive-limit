@@ -11,6 +11,12 @@
 
 local _M = {}
 
+local math_huge = math.huge
+
+local function finite_number(v)
+    return type(v) == "number" and v == v and v < math_huge and v > -math_huge
+end
+
 local ALGORITHMS = {
     gradient2 = true,
     aimd = true,
@@ -68,7 +74,7 @@ local function fail(msg)
 end
 
 local function positive_num(v, name)
-    if type(v) ~= "number" or v ~= v or v <= 0 or v == math.huge then
+    if not finite_number(v) or v <= 0 then
         return fail(name .. " must be a positive number")
     end
 end
@@ -152,11 +158,11 @@ function _M.build(user)
         "rejection_status", 400, 599)
     if err then return nil, err end
 
-    if type(cfg.retry_after) ~= "number" or cfg.retry_after < 0 then
+    if not finite_number(cfg.retry_after) or cfg.retry_after < 0 then
         return nil, fail("retry_after must be a non-negative number")
     end
 
-    if type(cfg.stale_threshold) ~= "number" or cfg.stale_threshold <= 0 then
+    if not finite_number(cfg.stale_threshold) or cfg.stale_threshold <= 0 then
         return nil, fail("stale_threshold must be a positive number")
     end
     if type(cfg.allow_internal) ~= "boolean" then
@@ -198,9 +204,7 @@ function _M.build(user)
     if err then return nil, err end
 
     cfg.aggregation_grace = opt("aggregation_grace", 0.35)
-    if type(cfg.aggregation_grace) ~= "number"
-        or cfg.aggregation_grace ~= cfg.aggregation_grace
-        or cfg.aggregation_grace < 0 then
+    if not finite_number(cfg.aggregation_grace) or cfg.aggregation_grace < 0 then
         return nil, fail("aggregation_grace must be a non-negative number")
     end
 
@@ -210,41 +214,40 @@ function _M.build(user)
 
     -- controller knobs
     cfg.rtt_tolerance = opt("rtt_tolerance", 2.0)
-    if type(cfg.rtt_tolerance) ~= "number" or cfg.rtt_tolerance <= 1
-        or cfg.rtt_tolerance ~= cfg.rtt_tolerance then
+    if not finite_number(cfg.rtt_tolerance) or cfg.rtt_tolerance <= 1 then
         return nil, fail("rtt_tolerance must be a number > 1")
     end
 
     cfg.min_gradient = opt("min_gradient", 0.5)
-    if type(cfg.min_gradient) ~= "number" or cfg.min_gradient <= 0
+    if not finite_number(cfg.min_gradient) or cfg.min_gradient <= 0
         or cfg.min_gradient >= 1 then
         return nil, fail("min_gradient must be in (0, 1)")
     end
 
     cfg.smoothing = opt("smoothing", 0.5)
-    if type(cfg.smoothing) ~= "number" or cfg.smoothing <= 0
+    if not finite_number(cfg.smoothing) or cfg.smoothing <= 0
         or cfg.smoothing > 1 then
         return nil, fail("smoothing must be in (0, 1]")
     end
 
     cfg.headroom_min = opt("headroom_min", 1)
     cfg.headroom_max = opt("headroom_max", 50)
-    if type(cfg.headroom_min) ~= "number" or cfg.headroom_min < 0 then
+    if not finite_number(cfg.headroom_min) or cfg.headroom_min < 0 then
         return nil, fail("headroom_min must be a non-negative number")
     end
-    if type(cfg.headroom_max) ~= "number"
+    if not finite_number(cfg.headroom_max)
         or cfg.headroom_max < cfg.headroom_min then
         return nil, fail("headroom_max must be >= headroom_min")
     end
 
     cfg.baseline_alpha = opt("baseline_alpha", 0.05)
-    if type(cfg.baseline_alpha) ~= "number" or cfg.baseline_alpha <= 0
+    if not finite_number(cfg.baseline_alpha) or cfg.baseline_alpha <= 0
         or cfg.baseline_alpha >= 1 then
         return nil, fail("baseline_alpha must be in (0, 1)")
     end
 
     cfg.sample_alpha = opt("sample_alpha", 0.5)
-    if type(cfg.sample_alpha) ~= "number" or cfg.sample_alpha <= 0
+    if not finite_number(cfg.sample_alpha) or cfg.sample_alpha <= 0
         or cfg.sample_alpha > 1 then
         return nil, fail("sample_alpha must be in (0, 1]")
     end
@@ -252,29 +255,29 @@ function _M.build(user)
     -- overload backoff
     cfg.overload_min_samples = opt("overload_min_samples", 20)
     err = integer_in_range(cfg.overload_min_samples,
-        "overload.min_samples", 1, 2 ^ 31)
+        "overload_min_samples", 1, 2 ^ 31)
     if err then return nil, err end
 
     cfg.overload_failure_ratio = opt("overload_failure_ratio", 0.10)
-    if type(cfg.overload_failure_ratio) ~= "number"
+    if not finite_number(cfg.overload_failure_ratio)
         or cfg.overload_failure_ratio <= 0
         or cfg.overload_failure_ratio > 1 then
-        return nil, fail("overload.failure_ratio must be in (0, 1]")
+        return nil, fail("overload_failure_ratio must be in (0, 1]")
     end
 
     cfg.overload_backoff = opt("overload_backoff", 0.80)
-    if type(cfg.overload_backoff) ~= "number" or cfg.overload_backoff <= 0
+    if not finite_number(cfg.overload_backoff) or cfg.overload_backoff <= 0
         or cfg.overload_backoff >= 1 then
-        return nil, fail("overload.backoff must be in (0, 1)")
+        return nil, fail("overload_backoff must be in (0, 1)")
     end
 
     -- aimd-specific
     cfg.aimd_increment = opt("aimd_increment", 1)
-    if type(cfg.aimd_increment) ~= "number" or cfg.aimd_increment <= 0 then
+    if not finite_number(cfg.aimd_increment) or cfg.aimd_increment <= 0 then
         return nil, fail("aimd_increment must be a positive number")
     end
     cfg.aimd_decrease = opt("aimd_decrease", 0.8)
-    if type(cfg.aimd_decrease) ~= "number" or cfg.aimd_decrease <= 0
+    if not finite_number(cfg.aimd_decrease) or cfg.aimd_decrease <= 0
         or cfg.aimd_decrease >= 1 then
         return nil, fail("aimd_decrease must be in (0, 1)")
     end

@@ -25,7 +25,9 @@ local function base_cfg()
 end
 
 local function healthy_window(sc, mean)
-    return { sample_count = sc or 1000, mean_rtt = mean or 0.020 }
+    sc = sc or 1000
+    return { sample_count = sc, mean_rtt = mean or 0.020,
+        completions = sc, rejected_count = 1 }
 end
 
 local function near(a, b, eps)
@@ -109,6 +111,26 @@ describe("gradient2", function()
             { sample_count = 0 }, base_cfg()))
         assert.True(next_state.held)
         assert.are.equal(137.5, next_state.limit)
+    end)
+
+    it("backs off on explicit failures even without latency samples", function()
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
+        local next_state = assert(common.safe_update(g2, state, {
+            sample_count = 0,
+            completions = 100,
+            connect_error_count = 100,
+        }, base_cfg()))
+        assert.are.equal(90, next_state.limit)
+        assert.are.equal(0.020, next_state.long_rtt)
+        assert.are.equal(0.020, next_state.short_rtt)
+    end)
+
+    it("does not grow when demand has not reached the current limit", function()
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
+        local m = healthy_window(100, 0.020)
+        m.rejected_count = 0
+        local next_state = assert(common.safe_update(g2, state, m, base_cfg()))
+        assert.are.equal(100, next_state.limit)
     end)
 
     it("seeds RTT state from the first sufficient window", function()

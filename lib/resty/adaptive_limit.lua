@@ -5,7 +5,7 @@
 -- observed completion latency and explicit overload signals.
 --
 -- See design.md for the architecture, README.md for usage, and
--- spec/ + t/ for the proof. Entry points:
+-- spec/ + t/ for verification. Entry points:
 --
 --   local adaptive = require "resty.adaptive_limit"
 --   local limiter  = assert(adaptive.new({ name = "payments",
@@ -52,7 +52,10 @@ function _M.start(opts)
 
     opts = opts or {}
     if opts.flush_interval ~= nil then
-        if type(opts.flush_interval) ~= "number" or opts.flush_interval <= 0 then
+        if type(opts.flush_interval) ~= "number"
+            or opts.flush_interval ~= opts.flush_interval
+            or opts.flush_interval <= 0
+            or opts.flush_interval == math.huge then
             return nil, "adaptive_limit: flush_interval must be a positive number"
         end
         runtime.flush_interval = opts.flush_interval

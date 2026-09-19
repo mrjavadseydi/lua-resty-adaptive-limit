@@ -1,4 +1,4 @@
--- Gradient2 adaptive concurrency controller (default algorithm).
+-- Windowed Gradient2-inspired concurrency controller (default algorithm).
 --
 -- Pure and deterministic: no ngx, no I/O, no clocks. Inputs are validated
 -- by controller.common.safe_update() before update() is called; the
@@ -27,14 +27,15 @@
 --             -- overload_failure_ratio: an overload must not be
 --             -- normalized into the baseline
 --   grad    = clamp(rtt_tolerance * long' / short', min_gradient, 1.0)
---   head    = clamp(sqrt(limit), headroom_min, headroom_max)
+--   head    = rejected_count > 0
+--             and clamp(sqrt(limit), headroom_min, headroom_max) or 0
 --   cand    = limit * grad + head
 --   cand    = min(cand, limit * overload_backoff)   -- on overload windows
 --   limit'  = clamp(limit * (1 - smoothing) + cand * smoothing,
 --                   min_limit, max_limit)
 --
--- Insufficient samples: no update at all (invariant 5) — low-traffic
--- windows must not move the limit, the baseline, or anything else.
+-- Insufficient latency samples hold the RTT state and limit unless enough
+-- explicit failures independently trigger overload backoff.
 -- short' == 0 (all zero-RTT samples, e.g. a mock backend) is treated as
 -- perfectly healthy: gradient 1, no division performed.
 
@@ -52,7 +53,14 @@ function _M.update(state, m, cfg)
     local limit = state.limit
     local sc = m.sample_count
 
-    if sc < cfg.min_samples then
+    local failure_count = m.overload_count + m.timeout_count
+        + m.connect_error_count
+    local completions = m.completions or sc
+    local overloaded = completions > 0
+        and failure_count / completions > cfg.overload_failure_ratio
+    local backoff = overloaded and completions >= cfg.overload_min_samples
+
+    if sc < cfg.min_samples and not backoff then
         return {
             limit = limit,
             long_rtt = state.long_rtt,
@@ -62,44 +70,47 @@ function _M.update(state, m, cfg)
         }
     end
 
-    local mean = m.mean_rtt
-
-    local short_rtt
-    if state.short_rtt == nil then
+    local short_rtt = state.short_rtt
+    local long_rtt = state.long_rtt
+    if sc >= cfg.min_samples and short_rtt == nil then
         -- First sufficient window seeds the RTT state directly instead
         -- of pretending some default RTT was observed.
-        short_rtt = mean
-    else
-        short_rtt = ewma(state.short_rtt, mean, cfg.sample_alpha)
+        short_rtt = m.mean_rtt
+    elseif sc >= cfg.min_samples then
+        short_rtt = ewma(short_rtt, m.mean_rtt, cfg.sample_alpha)
     end
 
-    local failure_count = m.overload_count + m.timeout_count
-        + m.connect_error_count
     -- strong overload signals only: 503s, timeouts and upstream connect
     -- failures; plain application errors (500-class) are never treated
     -- as capacity signals (design.md §4)
-    local overloaded = failure_count / sc > cfg.overload_failure_ratio
-
     -- The baseline is frozen on overloaded windows — including the very
     -- first one: seeding it from an overloaded RTT (restart mid-incident)
     -- would teach the controller that the overload is "healthy". With no
     -- baseline yet the gradient stays 1.0 and only the overload backoff
     -- acts; the first healthy window seeds it.
-    local long_rtt = state.long_rtt
-    if not overloaded then
+    if sc >= cfg.min_samples and not overloaded then
         long_rtt = ewma(long_rtt, short_rtt, cfg.baseline_alpha)
     end
 
-    local gradient = 1.0
-    if long_rtt ~= nil and short_rtt > 0 then
-        gradient = clamp(cfg.rtt_tolerance * long_rtt / short_rtt,
-                         cfg.min_gradient, 1.0)
+    local gradient = state.gradient
+    if sc >= cfg.min_samples then
+        gradient = 1.0
+        if long_rtt ~= nil and short_rtt > 0 then
+            gradient = clamp(cfg.rtt_tolerance * long_rtt / short_rtt,
+                             cfg.min_gradient, 1.0)
+        end
     end
 
-    local headroom = clamp(math_sqrt(limit), cfg.headroom_min, cfg.headroom_max)
-    local candidate = limit * gradient + headroom
+    -- Rejections prove offered demand reached the current cap. Without one,
+    -- suppress positive headroom so low-concurrency traffic cannot drift the
+    -- learned limit to max_limit; latency and overload can still reduce it.
+    local headroom = 0
+    if m.rejected_count > 0 then
+        headroom = clamp(math_sqrt(limit), cfg.headroom_min, cfg.headroom_max)
+    end
+    local candidate = limit * (gradient or 1.0) + headroom
 
-    if overloaded and sc >= cfg.overload_min_samples then
+    if backoff then
         candidate = math_min(candidate, limit * cfg.overload_backoff)
     end
 

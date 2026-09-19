@@ -20,7 +20,15 @@ function _M.update(state, m, cfg)
     local limit = state.limit
     local sc = m.sample_count
 
-    if sc < cfg.min_samples then
+    local failure_count = m.overload_count + m.timeout_count
+        + m.connect_error_count
+    local completions = m.completions or sc
+    local overloaded = completions > 0
+        and failure_count / completions > cfg.overload_failure_ratio
+    local strong_overload = overloaded
+        and completions >= cfg.overload_min_samples
+
+    if sc < cfg.min_samples and not strong_overload then
         return {
             limit = limit,
             long_rtt = state.long_rtt,
@@ -30,30 +38,26 @@ function _M.update(state, m, cfg)
         }
     end
 
-    local mean = m.mean_rtt
-
-    local short_rtt
-    if state.short_rtt == nil then
-        short_rtt = mean
-    else
-        short_rtt = ewma(state.short_rtt, mean, cfg.sample_alpha)
+    local short_rtt = state.short_rtt
+    if sc >= cfg.min_samples and short_rtt == nil then
+        short_rtt = m.mean_rtt
+    elseif sc >= cfg.min_samples then
+        short_rtt = ewma(short_rtt, m.mean_rtt, cfg.sample_alpha)
     end
-
-    local failure_count = m.overload_count + m.timeout_count
-        + m.connect_error_count
-    local congested = failure_count / sc > cfg.overload_failure_ratio
 
     -- baseline frozen on congested windows, the first one included (see
     -- gradient2.lua): never learn an overloaded RTT as healthy
     local long_rtt = state.long_rtt
-    if not congested then
+    if sc >= cfg.min_samples and not overloaded then
         long_rtt = ewma(long_rtt, short_rtt, cfg.baseline_alpha)
     end
 
     -- Latency congestion: the smoothed RTT exceeded rtt_tolerance times
     -- the baseline (the same shedding trigger Gradient2 uses, as a
     -- boolean instead of a gradient).
-    if not congested and long_rtt ~= nil and long_rtt > 0
+    local congested = strong_overload
+    if not congested and sc >= cfg.min_samples
+        and long_rtt ~= nil and long_rtt > 0
         and short_rtt > cfg.rtt_tolerance * long_rtt then
         congested = true
     end
@@ -61,6 +65,8 @@ function _M.update(state, m, cfg)
     local next_limit
     if congested then
         next_limit = limit * cfg.aimd_decrease
+    elseif m.rejected_count == 0 then
+        next_limit = limit
     else
         next_limit = limit + cfg.aimd_increment
     end

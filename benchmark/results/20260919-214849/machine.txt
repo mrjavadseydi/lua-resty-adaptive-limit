@@ -1,7 +1,0 @@
-machine: Linux 6.4.16-linuxkit aarch64
-cpu:     
-cores:   1
-memory:  978Mi
-docker:  inside-container
-openresty: nginx version: openresty/1.31.1.1
-date:    Sat Sep 19 21:48:49 UTC 2026

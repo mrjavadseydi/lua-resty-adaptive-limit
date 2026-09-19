@@ -14,34 +14,20 @@
 --       }
 --   }
 
-local prometheus = require "prometheus"
-
 local adaptive = require "resty.adaptive_limit"
 
-local metric_limit = prometheus:gauge(
-    "adaptive_limit_limit", "Current adaptive concurrency limit", { "limiter" })
-local metric_inflight = prometheus:gauge(
-    "adaptive_limit_inflight", "Currently in-flight admitted requests", { "limiter" })
-local metric_admitted = prometheus:counter(
-    "adaptive_limit_admitted_total", "Admitted requests", { "limiter" })
-local metric_rejected = prometheus:counter(
-    "adaptive_limit_rejected_total", "Rejected requests", { "limiter" })
-local metric_short_rtt = prometheus:gauge(
-    "adaptive_limit_sample_rtt_seconds", "Smoothed observed RTT", { "limiter" })
-local metric_long_rtt = prometheus:gauge(
-    "adaptive_limit_baseline_rtt_seconds", "Long-term RTT baseline", { "limiter" })
-local metric_gradient = prometheus:gauge(
-    "adaptive_limit_gradient", "Last controller gradient", { "limiter" })
-local metric_updates = prometheus:counter(
-    "adaptive_limit_controller_updates_total",
-    "Controller window updates", { "limiter" })
-local metric_skips = prometheus:counter(
-    "adaptive_limit_controller_skipped_total",
-    "Controller windows skipped/held", { "limiter" })
-local metric_internal = prometheus:counter(
-    "adaptive_limit_internal_errors_total", "Limiter internal errors", { "limiter" })
-local metric_anomalies = prometheus:counter(
-    "adaptive_limit_counter_anomalies_total", "Counter anomalies", { "limiter" })
+local prometheus
+local metric_limit
+local metric_inflight
+local metric_admitted
+local metric_rejected
+local metric_short_rtt
+local metric_long_rtt
+local metric_gradient
+local metric_updates
+local metric_skips
+local metric_internal
+local metric_anomalies
 
 local limiters = {}
 local prev_counts = {}
@@ -76,6 +62,31 @@ function M.register(limiter)
 end
 
 function M.init()
+    prometheus = require("prometheus").init("prometheus_metrics")
+    metric_limit = prometheus:gauge(
+        "adaptive_limit_limit", "Current adaptive concurrency limit", { "limiter" })
+    metric_inflight = prometheus:gauge(
+        "adaptive_limit_inflight", "Currently in-flight admitted requests", { "limiter" })
+    metric_admitted = prometheus:counter(
+        "adaptive_limit_admitted_total", "Admitted requests", { "limiter" })
+    metric_rejected = prometheus:counter(
+        "adaptive_limit_rejected_total", "Rejected requests", { "limiter" })
+    metric_short_rtt = prometheus:gauge(
+        "adaptive_limit_sample_rtt_seconds", "Smoothed observed RTT", { "limiter" })
+    metric_long_rtt = prometheus:gauge(
+        "adaptive_limit_baseline_rtt_seconds", "Long-term RTT baseline", { "limiter" })
+    metric_gradient = prometheus:gauge(
+        "adaptive_limit_gradient", "Last controller gradient", { "limiter" })
+    metric_updates = prometheus:counter(
+        "adaptive_limit_controller_updates_total",
+        "Controller window updates", { "limiter" })
+    metric_skips = prometheus:counter(
+        "adaptive_limit_controller_skipped_total",
+        "Controller windows skipped/held", { "limiter" })
+    metric_internal = prometheus:counter(
+        "adaptive_limit_internal_errors_total", "Limiter internal errors", { "limiter" })
+    metric_anomalies = prometheus:counter(
+        "adaptive_limit_counter_anomalies_total", "Counter anomalies", { "limiter" })
     M.register(assert(adaptive.new({
         name = "payments", shared_dict = "adaptive_limit",
     })))

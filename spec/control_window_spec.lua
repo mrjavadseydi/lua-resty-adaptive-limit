@@ -62,7 +62,25 @@ describe("control_window measurement validation", function()
             assert.are.equal(1, limiter.controller_updates or 0)
             assert.are.equal(100,
                 ngx.shared.adaptive_limit._data["al:1:pay:last_window"])
-        end)
+    end)
+
+    it("backs off on explicit failures without latency samples", function()
+        local limiter = fresh_limiter({
+            initial_limit = 50,
+            min_limit = 1,
+            max_limit = 100,
+        })
+        for _ = 1, 20 do
+            assert.True(limiter:try_acquire())
+            assert.True(limiter:release(nil, "connect_error"))
+        end
+        limiter:flush(1005)
+
+        assert.True(limiter:control_window(100, 1015))
+        assert.are.equal(45,
+            ngx.shared.adaptive_limit:get("al:1:pay:limit_f"))
+        assert.are.equal(1, limiter.controller_updates)
+    end)
 
     it("repairs out-of-policy limit when max_limit was lowered on reload",
         function()

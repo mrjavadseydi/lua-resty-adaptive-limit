@@ -1,9 +1,8 @@
 # Benchmarks
 
 All harnesses run inside the Docker test image (see `docker/Dockerfile.test`)
-so local runs and CI use identical tooling. Everything here exists to keep
-the performance section of the README honest: measured truth over
-marketing numbers, baseline comparison over absolute figures.
+so local runs and CI use identical tooling. These results keep the README
+numbers reproducible and emphasize baseline comparisons over absolute figures.
 
 ## Methodology
 

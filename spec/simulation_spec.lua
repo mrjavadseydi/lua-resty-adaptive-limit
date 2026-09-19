@@ -89,6 +89,8 @@ function sim:step()
         sample_count = ok_completions,
         mean_rtt = mean,
         timeout_count = timeouts,
+        completions = completions,
+        rejected_count = self.demand > self.limit and 1 or 0,
     }
     local state = {
         limit = self.float_limit,
@@ -201,6 +203,8 @@ describe("simulation D: single latency outlier", function()
         local m = {
             sample_count = 5000,
             mean_rtt = (5000 * 0.020 + 5.0) / 5001,
+            completions = 5000,
+            rejected_count = 1,
         }
         local state = { limit = s.float_limit, long_rtt = s.long_rtt,
             short_rtt = s.short_rtt }

@@ -1,1 +1,0 @@
-nginx: [emerg] "lua_shared_dict" directive is not allowed here in /tmp/resty_rnqGvAiFNf/conf/nginx.conf:27

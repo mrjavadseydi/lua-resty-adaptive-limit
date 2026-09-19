@@ -91,4 +91,21 @@ describe("config.build", function()
         assert.falsy(config.build(nil))
         assert.falsy(config.build("name=payments"))
     end)
+
+    it("rejects non-finite numeric options", function()
+        local fields = {
+            "retry_after", "stale_threshold", "aggregation_grace",
+            "rtt_tolerance", "min_gradient", "smoothing", "headroom_min",
+            "headroom_max", "baseline_alpha", "sample_alpha",
+            "overload_failure_ratio", "overload_backoff", "aimd_increment",
+            "aimd_decrease",
+        }
+        for _, field in ipairs(fields) do
+            for _, value in ipairs({ 0 / 0, math.huge, -math.huge }) do
+                local opts = valid_base()
+                opts[field] = value
+                assert.falsy(config.build(opts), field .. " accepted non-finite value")
+            end
+        end
+    end)
 end)

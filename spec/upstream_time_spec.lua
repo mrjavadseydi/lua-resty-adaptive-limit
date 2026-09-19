@@ -37,6 +37,13 @@ describe("upstream_time.parse", function()
         assert.are.equal(0.060, parser.parse("0.010, 0.020, 0.030", "sum"))
     end)
 
+    it("parses colons between upstream groups", function()
+        local raw = "0.005, 0.010 : 0.020, 0.030"
+        assert.are.equal(0.030, parser.parse(raw, "last"))
+        assert.are.equal(0.030, parser.parse(raw, "max"))
+        assert.are.equal(0.065, parser.parse(raw, "sum"))
+    end)
+
     it("rejects values containing '-' attempts instead of guessing", function()
         assert.Nil(parser.parse("0.005, -", "last"))
     end)

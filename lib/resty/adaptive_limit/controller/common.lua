@@ -51,7 +51,7 @@ end
 -- never by the sample count itself: aborted outcomes and unusable
 -- latencies are completions but not samples, so a legitimate abort-heavy
 -- window has class counts exceeding sample_count. The wiring always
--- supplies completions; direct callers (algorithm specs) may omit it,
+-- supplies completions and rejected_count; direct callers may omit them,
 -- in which case the sum checks are skipped.
 function _M.validate_measurement(m, cfg)
     if type(m) ~= "table" then
@@ -76,8 +76,9 @@ function _M.validate_measurement(m, cfg)
     local cer = m.connect_error_count or 0
     local err = m.error_count or 0
     local abt = m.aborted_count or 0
+    local rej = m.rejected_count or 0
     if not is_count(ovl) or not is_count(tmo) or not is_count(cer)
-        or not is_count(err) or not is_count(abt) then
+        or not is_count(err) or not is_count(abt) or not is_count(rej) then
         return nil, "invalid outcome counts"
     end
 
@@ -102,6 +103,7 @@ function _M.validate_measurement(m, cfg)
         connect_error_count = cer,
         error_count = err,
         aborted_count = abt,
+        rejected_count = rej,
         completions = cmp,
     }
 end

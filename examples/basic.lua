@@ -44,7 +44,7 @@ assert(adaptive.new({
 }))
 
 -- Observability: a cheap snapshot accessor for a status endpoint or
--- an external scraper. See prometheus.lua for metrics integration.
+-- an external scraper. See prometheus_example.lua for metrics integration.
 return {
     snapshots = function()
         local out = {}

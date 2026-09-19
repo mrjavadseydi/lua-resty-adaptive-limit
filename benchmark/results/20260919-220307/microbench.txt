@@ -1,4 +1,0 @@
-raw dict get+incr           0.090 us/op  (200000 ops in 0.02s)
-try_acquire (admit)         0.220 us/op  (200000 ops in 0.04s)
-release                     0.125 us/op  (200000 ops in 0.02s)
-try_acquire (reject)        0.340 us/op  (200000 ops in 0.07s)

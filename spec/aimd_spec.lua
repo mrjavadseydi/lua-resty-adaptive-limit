@@ -24,7 +24,8 @@ local function base_cfg()
 end
 
 local function window(sc, mean)
-    return { sample_count = sc, mean_rtt = mean }
+    return { sample_count = sc, mean_rtt = mean,
+        completions = sc, rejected_count = 1 }
 end
 
 describe("aimd", function()
@@ -59,6 +60,40 @@ describe("aimd", function()
         local next_state = assert(common.safe_update(aimd, state,
             window(19, 0.5), base_cfg()))
         assert.True(next_state.held)
+        assert.are.equal(100, next_state.limit)
+    end)
+
+    it("backs off on explicit failures even without latency samples", function()
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
+        local next_state = assert(common.safe_update(aimd, state, {
+            sample_count = 0,
+            completions = 100,
+            timeout_count = 100,
+        }, base_cfg()))
+        assert.are.equal(80, next_state.limit)
+    end)
+
+    it("honors overload_min_samples", function()
+        local cfg = base_cfg()
+        cfg.min_samples = 1
+        cfg.overload_min_samples = 20
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
+        local next_state = assert(common.safe_update(aimd, state, {
+            sample_count = 1,
+            mean_rtt = 0.020,
+            completions = 1,
+            timeout_count = 1,
+            rejected_count = 1,
+        }, cfg))
+        assert.are.equal(101, next_state.limit)
+        assert.are.equal(0.020, next_state.long_rtt)
+    end)
+
+    it("does not grow when demand has not reached the current limit", function()
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
+        local m = window(100, 0.020)
+        m.rejected_count = 0
+        local next_state = assert(common.safe_update(aimd, state, m, base_cfg()))
         assert.are.equal(100, next_state.limit)
     end)
 

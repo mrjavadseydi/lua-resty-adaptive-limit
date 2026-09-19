@@ -33,8 +33,8 @@ API simplicity.
 - **Documented behavior is pinned by tests.** If you change behavior —
   redirect handling, failure modes, classification — the corresponding
   test in `t/` or `spec/` must be updated in the same change.
-- **Honest documentation.** Limitations are documented, not papered over.
-  Claims need a test, a simulation, or a benchmark behind them.
+- **Evidence-backed documentation.** Claims need a test, simulation, or
+  benchmark behind them, and limitations belong in the README.
 - LuaJIT-compatible Lua 5.1 syntax only (no Lua 5.3+ features). No FFI in
   the core. No new runtime dependencies.
 

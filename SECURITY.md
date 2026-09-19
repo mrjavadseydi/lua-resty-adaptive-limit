@@ -21,10 +21,10 @@ untrusted**:
 
 ## Reporting a vulnerability
 
-Open a GitHub issue marked `security` or contact the maintainer directly
-(see the repository). Please include a minimal reproduction and the
-OpenResty version. Security-relevant fixes will be released as patch
-versions with a CHANGELOG entry.
+Use GitHub's private vulnerability reporting for this repository. Do not
+open a public issue for an undisclosed vulnerability. Include a minimal
+reproduction and the OpenResty version. Security-relevant fixes will be
+released as patch versions with a CHANGELOG entry.
 
 ## Known non-issues by design
 

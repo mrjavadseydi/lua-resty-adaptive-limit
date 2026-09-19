@@ -26,9 +26,10 @@ init_worker_by_lua_block {
 --- config
 location /work {
     content_by_lua_block {
-        for i = 1, 50 do
-            assert(PAY:try_acquire())
-            assert(PAY:release(0.020, "success"))
+        for _ = 1, 5 do
+            for i = 1, 10 do assert(PAY:try_acquire()) end
+            assert(not PAY:try_acquire()) -- prove demand reached the cap
+            for i = 1, 10 do assert(PAY:release(0.020, "success")) end
         end
         ngx.say("done")
     }
@@ -188,11 +189,17 @@ init_worker_by_lua_block {
 --- config
 location /work {
     content_by_lua_block {
-        for i = 1, 50 do
-            assert(PAY:try_acquire())
-            assert(PAY:release(0.020, "success"))
-            assert(SEARCH:try_acquire())
-            assert(SEARCH:release(0.020, "success"))
+        for _ = 1, 5 do
+            for i = 1, 10 do
+                assert(PAY:try_acquire())
+                assert(SEARCH:try_acquire())
+            end
+            assert(not PAY:try_acquire())
+            assert(not SEARCH:try_acquire())
+            for i = 1, 10 do
+                assert(PAY:release(0.020, "success"))
+                assert(SEARCH:release(0.020, "success"))
+            end
         end
         ngx.say("done")
     }
