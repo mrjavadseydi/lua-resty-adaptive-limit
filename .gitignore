@@ -17,5 +17,4 @@ benchmark/tmp/
 *.swp
 *~
 
-# ZCode workspace state
-.zcode/
+benchmark/results/*/*-r[0-9].txt

@@ -359,7 +359,7 @@ operations, executed by at most one worker, once per `sample_window`.
 - `internal_error` — shared dict failures (missing zone, no memory,
   unexpected errors), invalid state. Governed by `failure_mode`:
   `fail_open` (default) admits the request *without holding a slot* (so
-  there is nothing to release; `log()` still records the observation) —
+  there is nothing to release and `log()` records nothing) —
   availability over protection; `fail_closed` rejects. The limiter never
   crashes a request because of its own errors.
 - `not_started` — `adaptive.start()` was not called (or `new()` was never
@@ -452,7 +452,7 @@ self-heal immediately as old workers finish draining.
   hang; the limiter keeps shedding at the limit (backpressure holds) and
   surfaces `controller_stalled` for alerting.
 - Abrupt worker death leaks that worker's slots (§9) — surfaced, not hidden.
-- Shared-dict sizing guidance (README): ≈50 small entries per limiter
+- Shared-dict sizing guidance (README): ~10 permanent keys per limiter
   plus ≤ 3 live windows × 9 accumulator keys and `worker_count` heartbeat
   slots; a 10m zone comfortably serves dozens of limiters. `state()`
   exposes `shared_dict_capacity`/`shared_dict_free` for monitoring.
@@ -480,9 +480,9 @@ self-heal immediately as old workers finish draining.
 | Controller properties under generated inputs | busted fuzz specs (seeded PRNG) |
 | Scenarios A–H | deterministic simulations (`spec/simulation_spec.lua`) |
 | Admission races, multi-worker caps | Test::Nginx `t/admission.t`, `t/multi_worker.t` (1/2/4 workers, 100 concurrent vs limit 10, thousands of reps) |
-| Lifecycle (§52 list) | `t/lifecycle.t` |
+| Lifecycle (§2 contract) | `t/lifecycle.t` |
 | Reload under traffic | `t/resilience.t`, `benchmark/resilience.sh` (HUP × N while wrk drives requests) |
 | Worker SIGKILL | `benchmark/resilience.sh` |
 | Controller integration (windows, lease, backoff) | `t/controller.t` |
 | Bounded memory / no leaks | `benchmark/soak.sh` + `t/stats.t` assertions |
-| Overhead vs baseline | `benchmark/run.sh` (baseline vs fixed-counter vs adaptive; 1/2/4/8 workers) |
+| Overhead vs baseline | `benchmark/run.sh` (baseline vs fixed-counter vs adaptive; 1/2/4 workers) |

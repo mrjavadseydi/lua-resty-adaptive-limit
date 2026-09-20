@@ -109,7 +109,7 @@ Two planes, strictly separated:
 **Fast path** (per request): read the current limit, take one atomic
 shared-dict increment — the admission linearization point — admit, or
 roll the increment back and reject. No locks, no queues, no regex, no
-JSON, no logging, no allocation: **0.245 µs** per admission, **0.125 µs**
+JSON, no logging, no allocation: **0.22 µs** per admission, **0.125 µs**
 per release ([Performance](#performance)). For a stable limit `L`, more
 than `L` requests can never pass admission simultaneously (proven under
 real multi-worker load in `t/admission.t` and `t/multi_worker.t`).
@@ -417,6 +417,9 @@ raw per-repetition outputs, including noisy runs, are kept under
   protected resource is backend processing.
 * **Config changes** take effect on reload; the learned limit persists and
   is immediately clamped to a changed `min_limit`/`max_limit` range.
+* **`lua_code_cache on` is required** (the default). With it off, every
+  request runs in a fresh Lua VM that has no registry and never saw
+  `start()`: `get()` raises and `try_acquire()` returns `not_started`.
 * `log_by_lua` does not run for subrequests (platform behavior); the
   lifecycle helper relies on the documented redirect semantics pinned in
   `t/lifecycle.t`.

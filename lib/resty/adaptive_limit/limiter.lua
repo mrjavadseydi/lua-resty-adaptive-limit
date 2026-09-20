@@ -1,5 +1,5 @@
--- The limiter instance: admission, release, and (from later phases)
--- lifecycle helpers, statistics and controller wiring.
+-- The limiter instance: admission, release, lifecycle helpers,
+-- statistics and controller wiring.
 --
 -- Concurrency notes that the whole file depends on:
 --
@@ -211,7 +211,10 @@ function _M:reseed_shared_state()
     -- state adopts it (checked by the caller before calling this).
     self.st.dict:set(self.K_limit, cfg.initial_limit)
     self.st.dict:set(st.K.limit_f, cfg.initial_limit)
-    self.st.dict:set(st.K.inflight, 0)
+    -- add, not set: a sibling worker may already be serving requests by
+    -- the time this worker runs its init; zeroing a live counter would
+    -- over-admit until the next negative-inflight snap
+    self.st.dict:add(st.K.inflight, 0)
     self.st.dict:set(st.K.last_window, 0)
     self.st.dict:set(st.K.last_update, ngx_now())
     self._last_limit = cfg.initial_limit

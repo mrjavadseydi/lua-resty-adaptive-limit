@@ -46,6 +46,7 @@ make resilience     # HUP reloads + worker SIGKILL under real traffic
 
 ## Results
 
-Published numbers live in `results/` (git-tracked summaries, raw wrk
-output per run) and in the README performance table. When re-running on
+Published numbers live in `results/` (git-tracked `summary.txt`,
+`microbench.txt` and `machine.txt` per run; raw per-repetition wrk output
+is ignored) and in the README performance table. When re-running on
 your hardware, note the VM/CPU details from `machine.txt` before comparing.

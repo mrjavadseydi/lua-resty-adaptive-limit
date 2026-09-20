@@ -31,8 +31,9 @@ local _M = {
 --- Create (or, per worker VM, re-create) a named limiter.
 -- Configuration is validated here, once; an invalid configuration is a
 -- startup error, never a runtime surprise. Typically called from a module
--- required by init_by_lua (early validation) and re-executed by every
--- worker (fresh per-worker instance registered with the scheduler).
+-- required by init_by_lua: workers fork the master VM and inherit the
+-- registry (requires lua_code_cache on). Calling it from init_worker_by_lua
+-- instead works the same way.
 --
 -- Returns nil + message on invalid configuration, an unusable shared
 -- dictionary, or a duplicate name within this worker.

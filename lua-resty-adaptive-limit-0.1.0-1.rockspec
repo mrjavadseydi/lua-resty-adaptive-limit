@@ -2,7 +2,7 @@ package = "lua-resty-adaptive-limit"
 version = "0.1.0-1"
 source = {
    url = "git+https://github.com/javadseydi/lua-resty-adaptive-limit.git",
-   branch = "v0.1.0",
+   tag = "v0.1.0",
 }
 description = {
    summary = "Adaptive concurrency limiting and load shedding for OpenResty",

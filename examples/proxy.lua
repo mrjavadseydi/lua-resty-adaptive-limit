@@ -38,8 +38,8 @@ local function access()
     end
 
     -- Limiter-internal failure (shared dict trouble, ...). The error is
-    -- already counted; under fail_open you usually proceed WITHOUT a
-    -- slot (nothing to release), under fail_closed you reject here.
+    -- already counted. This example fails closed; to fail open instead,
+    -- return true here WITHOUT setting payments_slot (nothing to release).
     ngx.log(ngx.ERR, "adaptive limiter internal error: ", err)
     return ngx.exit(503)
 end

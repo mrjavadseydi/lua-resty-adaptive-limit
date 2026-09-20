@@ -3,7 +3,7 @@
 --
 --   luarocks install nginx-lua-prometheus
 --
--- Metric names follow design.md §13. Labels: the limiter name only — no
+-- Labels: the limiter name only — no
 -- high-cardinality labels anywhere.
 --
 --   http {
@@ -34,14 +34,11 @@ local prev_counts = {}
 
 local function inc_delta(metric, name, field, current, labels)
     current = current or 0
-    -- Keyed per worker: /metrics can be served by any worker process, and
-    -- each worker's lim:state() counters are worker-local (see
-    -- limiter.lua's state() doc). Without the worker id, a scrape landing
-    -- on a different worker than the previous one looks like a counter
-    -- reset and its whole total gets re-added on top of what was already
-    -- counted. Keying by worker keeps each worker's own series monotonic;
-    -- the metric still sums correctly across workers over time.
-    local key = name .. ":" .. field .. ":" .. tostring(ngx.worker.id())
+    -- lim:state() counters and prev_counts are both worker-local, while
+    -- the prometheus metric lives in a shared dict: each worker adds only
+    -- its own delta, so the metric sums correctly across workers as long
+    -- as every worker gets scraped now and then.
+    local key = name .. ":" .. field
     local prev = prev_counts[key] or 0
     if current >= prev then
         local delta = current - prev
@@ -97,7 +94,6 @@ function M.init()
 end
 
 function M.collect()
-    prometheus:collect()
     for i = 1, #limiters do
         local lim = limiters[i]
         local s = lim:state() -- a handful of dict reads per scrape: fine
@@ -117,6 +113,8 @@ function M.collect()
         inc_delta(metric_internal, name, "internal", s.internal_errors, labels)
         inc_delta(metric_anomalies, name, "anomalies", s.counter_anomalies, labels)
     end
+    -- collect() prints the exposition: it must run after the gauges are set
+    prometheus:collect()
 end
 
 return M
