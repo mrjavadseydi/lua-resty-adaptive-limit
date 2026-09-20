@@ -1,9 +1,10 @@
 package = "lua-resty-adaptive-limit"
 version = "0.1.0-1"
 source = {
-   url = "git+https://github.com/javadseydi/lua-resty-adaptive-limit.git",
-   tag = "v0.1.0",
+    url = "git+https://github.com/mrjavadseydi/lua-resty-adaptive-limit.git",
+    tag = "v0.1.0",
 }
+
 description = {
    summary = "Adaptive concurrency limiting and load shedding for OpenResty",
    detailed = [[
@@ -19,7 +20,7 @@ updates, Gradient2 (default) and AIMD controllers, graceful-reload
 state preservation, worker-exit reconciliation, stuck-pool
 diagnostics, and no runtime dependencies beyond OpenResty >= 1.15.8.1.
 ]],
-   homepage = "https://github.com/javadseydi/lua-resty-adaptive-limit",
+   homepage = "https://github.com/mrjavadseydi/lua-resty-adaptive-limit",
    license = "MIT",
 }
 dependencies = {
