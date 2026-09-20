@@ -185,6 +185,8 @@ function _M.new(user_cfg)
         -- partially failed flush must finish before moving on
         _flush_window = nil,
         _flush_pending = nil,
+        -- last stats.last_completion value published to the shared dict
+        _lc_published = nil,
         -- flushed-marker mirror of the monotonic stats fields: flush()
         -- writes deltas against these into the shared window
         -- accumulators and advances them by exactly the written delta
@@ -321,15 +323,20 @@ function _M:try_acquire()
         dict:set(self.K_limit, limit)
         rate_limited_log(self, "limit_missing", ngx_WARN,
             "limit key missing; re-seeded from last observed value")
-    elseif type(limit) ~= "number" or limit ~= limit or limit < 0 then
-        -- Corrupted shared value: never trust it and never crash the
-        -- request comparing against it. Replace with the
-        -- last observed limit and surface.
+    elseif type(limit) ~= "number" or limit ~= limit
+        or limit < self.cfg.min_limit or limit > self.cfg.max_limit then
+        -- Corrupted shared value (non-numeric, NaN, or outside the
+        -- configured policy — every legitimate publication is clamped
+        -- into [min_limit, max_limit], so +inf or 10^9 can only be a
+        -- foreign write): never trust it and never crash the request
+        -- comparing against it. Replace with the last observed limit
+        -- and surface.
         count_anomaly(self, "limit_corrupted")
         limit = self._last_limit or self.cfg.initial_limit
         dict:set(self.K_limit, limit)
         rate_limited_log(self, "limit_corrupted", ngx_ERR,
-            "limit key corrupted (non-numeric/negative); re-seeded")
+            "limit key corrupted (non-numeric or outside ",
+            "[min_limit, max_limit]); re-seeded")
     end
     self._last_limit = limit
 
@@ -385,10 +392,6 @@ function _M:release(latency, outcome)
     if not runtime.started then
         return nil, errors.NOT_STARTED
     end
-    if outcome ~= nil and not OUTCOMES[outcome] then
-        return nil, errors.INVALID_STATE
-    end
-    outcome = outcome or "success"
 
     local dict = self.st.dict
 
@@ -404,9 +407,12 @@ function _M:release(latency, outcome)
         return internal_error(self, "incr(inflight, -1)", err)
     end
     if n < 0 then
-        -- Double release (or a lost admission): snap to zero and surface.
+        -- Double release (or a lost admission): undo our own excess
+        -- decrement with an atomic incr rather than set(0) — another
+        -- worker may have admitted between the two operations, and a
+        -- set would erase that legitimate slot. Surface it.
         count_anomaly(self, "negative_inflight")
-        dict:set(self.K_inflight, 0)
+        dict:incr(self.K_inflight, -n)
         rate_limited_log(self, "negative", ngx_WARN,
             "inflight went negative; double release suspected")
     end
@@ -414,7 +420,20 @@ function _M:release(latency, outcome)
         self._inflight = self._inflight - 1
     end
 
-    -- 2. Record the observation (never blocks the release: fixed-size
+    -- 2. Validate the observation. The slot is already released: an
+    --    outcome typo in one code path must never leak concurrency, so
+    --    it is dropped and surfaced instead of refused.
+    if outcome == nil then
+        outcome = "success"
+    elseif not OUTCOMES[outcome] then
+        count_anomaly(self, "bad_outcome")
+        rate_limited_log(self, "bad_outcome", ngx_ERR,
+            "release(): unknown outcome ", tostring(outcome),
+            "; observation dropped")
+        return true
+    end
+
+    -- 3. Record the observation (never blocks the release: fixed-size
     --    struct updates only). sample_count counts usable latency
     --    observations; outcome counters count every completed outcome;
     --    completions counts every non-ignored outcome (the denominator
@@ -690,6 +709,15 @@ function _M:tick(now, worker_id)
         self.st:heartbeat(worker_id, now, HB_TTL)
     end
     self:flush(now)
+    -- Publish this worker's newest completion time so the stuck
+    -- diagnostics in state() see the whole instance, not one worker
+    -- (an idle worker next to saturated siblings would otherwise report
+    -- a false stall). Monotonic max; once per tick, never per request.
+    local lc = self.stats.last_completion
+    if lc and lc ~= self._lc_published then
+        self.st:publish_last_completion(lc)
+        self._lc_published = lc
+    end
     self:control(now)
 end
 
@@ -844,8 +872,17 @@ function _M:control_window(n, now)
         self.controller_updates = (self.controller_updates or 0) + 1
     end
 
-    st:publish_controller_state(next_state.limit, next_state.long_rtt,
-        next_state.short_rtt, next_state.gradient, n, now)
+    local pok, perr = st:publish_controller_state(next_state.limit,
+        next_state.long_rtt, next_state.short_rtt, next_state.gradient, n, now)
+    if not pok then
+        -- Partial publication (no memory, ...): last_window is written
+        -- last, so it did not advance and the window's accumulators are
+        -- kept — the next tick re-processes it instead of losing it.
+        self.internal_errors = self.internal_errors + 1
+        rate_limited_log(self, "publish", ngx_ERR,
+            "controller state publish failed: ", perr or "unknown")
+        return false
+    end
     self._last_limit = math.floor(next_state.limit)
     st:delete_window(n)
 
@@ -892,7 +929,7 @@ function _M:exit_worker()
         return nil, errors.INTERNAL_ERROR
     end
     if n < 0 then
-        dict:set(self.K_inflight, 0)
+        dict:incr(self.K_inflight, -n) -- see release(): atomic, not set(0)
     end
     self._inflight = 0
     count_anomaly(self, "exit_with_inflight", held)
@@ -932,13 +969,20 @@ function _M:state()
 
     local limit = getnum(K.limit)
     local inflight = getnum(K.inflight)
-    local since_completion = s.last_completion and (now - s.last_completion)
+    -- newest completion across the instance: the shared value is
+    -- published once per tick (see tick()), this worker's own may be a
+    -- tick fresher
+    local last_completion = getnum(K.last_completion)
+    if s.last_completion
+        and (last_completion == nil or s.last_completion > last_completion) then
+        last_completion = s.last_completion
+    end
+    local since_completion = last_completion and (now - last_completion)
 
-    -- Stuck diagnostics (design.md §9): the pool is exhausted and this
-    -- worker has seen no completions for stale_threshold seconds. A
+    -- Stuck diagnostics (design.md §9): the pool is exhausted and no
+    -- worker has seen a completion for stale_threshold seconds. A
     -- completion-based controller cannot observe a fully hung backend;
-    -- backpressure still holds, and this flag makes it visible. Note
-    -- `last_completion` is this worker's view (worker-local).
+    -- backpressure still holds, and this flag makes it visible.
     local stalled = inflight ~= nil and limit ~= nil
         and inflight >= limit
         and (since_completion == nil

@@ -12,6 +12,14 @@ local function valid_base()
 end
 
 describe("config.build", function()
+    it("rejects unknown options (typos must not activate defaults)", function()
+        local c = valid_base()
+        c.initial_limti = 5
+        local cfg, err = config.build(c)
+        assert.is_nil(cfg)
+        assert.match('unknown option "initial_limti"', err, 1, true)
+    end)
+
     it("accepts a minimal valid configuration and applies defaults", function()
         local cfg = assert(config.build(valid_base()))
         assert.are.equal("payments", cfg.name)

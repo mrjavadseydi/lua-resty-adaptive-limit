@@ -169,8 +169,9 @@ dropped with an anomaly; they cannot corrupt statistics. `outcome`:
 `"aborted"`, `"ignored"` (default `"success"`). Aborted requests release
 their slot but contribute no latency sample (a truncated duration is not a
 capacity signal); `ignored` contributes nothing at all (health checks).
-Passing an invalid outcome returns `nil, "invalid_state"` and the slot is
-**not** released — pass `nil` or a valid outcome string.
+An unknown outcome string (a typo) still releases the slot; the
+observation is dropped with a `bad_outcome` anomaly and a rate-limited
+error log, so a typo in one code path can never leak concurrency.
 A negative counter result — double release — is snapped to zero and
 counted as an anomaly; it is surfaced, never hidden.
 
@@ -240,8 +241,9 @@ closed window's raw accumulators — note: accumulators are deleted once
 processed, so `last_sample_count` is non-zero only during the grace window),
 worker-local counters (`admitted_total`, `rejected_total`, `controller_updates`,
 `controller_skips`, `internal_errors`, `counter_anomalies`, `timer_failures`),
-and diagnostics: `controller_stalled` (pool exhausted with no recent completions —
-the hung-backend scenario; backpressure still holds and this makes it visible),
+and diagnostics: `controller_stalled` (pool exhausted with no recent completions on any
+worker — the hung-backend scenario; backpressure still holds and this makes
+it visible),
 `workers_active`/`workers_expected` (heartbeat liveness),
 `last_completion_age`, `shared_dict_capacity`/`shared_dict_free`.
 
@@ -326,7 +328,9 @@ raises `limit_missing` anomalies rather than admitting unbounded.
 * **Missing/corrupted critical state** (eviction, operator flush,
   corruption): re-seeded from the worker's last observed limit — fresh to
   within one window — with a `limit_missing`/`limit_corrupted` anomaly;
-  a non-numeric `inflight` counter is snapped to 0 (`inflight_corrupted`).
+  a limit outside `[min_limit, max_limit]` (including `inf`) is treated
+  the same way; a non-numeric `inflight` counter is snapped to 0
+  (`inflight_corrupted`).
   The limiter never crashes a request comparing against garbage.
 * **Graceful reload (`nginx -s reload`)**: the shared dictionary
   survives; new workers validate the schema marker and adopt the learned
@@ -390,12 +394,12 @@ try_acquire (reject)        0.345 us/op
 ```
 
 The complete admission path adds ~0.125 us over the raw shared-dict
-floor. Sustained-load behavior (8-minute soak, ~2.9 M requests): worker
+floor. Sustained-load behavior (10-minute soak, ~2.9 M requests): worker
 RSS flat at ~21.5 MB (-502 kB between first and last quarter), Lua GC
 oscillating 0.7-1.2 MB with zero trend -- memory does not grow with
-requests served. No benchmark methodology was tuned toward a target; the
-raw per-repetition outputs, including noisy runs, are kept under
-`benchmark/results/`.
+requests served. No benchmark methodology was tuned toward a target; every
+repetition's number, including noisy runs, is listed in
+`benchmark/results/<run>/summary.txt`.
 
 ## Limitations
 

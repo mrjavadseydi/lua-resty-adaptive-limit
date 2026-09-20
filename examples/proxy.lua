@@ -1,8 +1,9 @@
 -- Low-level API usage: maximum performance, explicit accounting.
 --
 -- The low-level API never touches ngx.ctx, never builds strings and
--- never allocates: it is two shared-dict operations per admitted request
--- and one on rejection. Use it when the lifecycle helpers do not fit
+-- never allocates: an admitted request costs one dict read + one atomic
+-- incr, plus one incr to release; a rejected one costs the read + incr
+-- + a rollback incr. Use it when the lifecycle helpers do not fit
 -- (e.g. non-HTTP traffic, custom completion signals) or when you want
 -- full control of the observation.
 
@@ -16,6 +17,11 @@ local payments = assert(adaptive.new({
     max_limit = 2000,
     failure_mode = "fail_open",
 }))
+
+local OUTCOMES = {
+    [499] = "aborted", [502] = "connect_error",
+    [503] = "overload", [504] = "timeout",
+}
 
 -- access_by_lua ---------------------------------------------------------
 local function access()
@@ -58,8 +64,13 @@ local function log()
     -- release() decrements first, records the observation second;
     -- it never yields. Outcomes: success, timeout, connect_error,
     -- overload, error, aborted, ignored.
-    local ok, err = payments:release(ngx.now() - ngx.req.start_time(),
-        ngx.status >= 500 and "error" or "success")
+    -- Same classification the lifecycle helper uses: 502/503/504 are
+    -- strong overload signals, other 5xx are application errors, 499 is
+    -- a client abort (slot released, latency not sampled).
+    local status = ngx.status
+    local outcome = OUTCOMES[status]
+        or (status >= 500 and "error" or "success")
+    local ok, err = payments:release(ngx.now() - ngx.req.start_time(), outcome)
     if not ok then
         -- the slot could not be released: surfaced in the limiter's
         -- internal_errors; a single retry of release() is safe

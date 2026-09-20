@@ -139,6 +139,40 @@ describe("admission", function()
         assert.are.equal(1, limiter.anomalies.negative_inflight)
     end)
 
+    it("negative-inflight repair keeps a sibling's concurrent admission", function()
+        local limiter, dict = fresh_env()
+        -- inflight is 0; a double release drives it to -1, and another
+        -- worker admits (incr +1) before the repair runs
+        local incr = dict.incr
+        local injected = false
+        dict.incr = function(d, key, delta, init)
+            local n, err = incr(d, key, delta, init)
+            if not injected and key == "al:1:payments:inflight" and n == -1 then
+                injected = true
+                incr(d, key, 1) -- the sibling's admission
+            end
+            return n, err
+        end
+        assert.True(limiter:release(0.010))
+        dict.incr = incr
+        -- set(0) would have erased the sibling's slot; incr(+1) keeps it
+        assert.are.equal(1, dict._data["al:1:payments:inflight"])
+        assert.are.equal(1, limiter.anomalies.negative_inflight)
+    end)
+
+    it("treats a limit above max_limit (or inf) as corrupted", function()
+        local limiter, dict = fresh_env()
+        dict._data["al:1:payments:limit"] = math.huge
+        for _ = 1, 10 do
+            assert.True(limiter:try_acquire())
+        end
+        local ok, err = limiter:try_acquire()
+        assert.falsy(ok)
+        assert.are.equal(errors.REJECTED, err)
+        assert.are.equal(1, limiter.anomalies.limit_corrupted)
+        assert.are.equal(10, dict._data["al:1:payments:limit"])
+    end)
+
     it("re-seeds from the last observed limit when the key disappears", function()
         local limiter, dict = fresh_env()
         assert.True(limiter:try_acquire())
@@ -190,15 +224,17 @@ describe("admission", function()
         assert.are.equal(0, dict._data["al:1:payments:inflight"])
     end)
 
-    it("rejects unknown outcomes with a distinct error", function()
-        local limiter = fresh_env()
-        assert.True(limiter:try_acquire())
-        local ok, err = limiter:release(0.1, "totally_broken")
-        assert.falsy(ok)
-        assert.are.equal(errors.INVALID_STATE, err)
-        -- nothing was released
-        assert.are.equal(1, limiter._inflight)
-    end)
+    it("releases the slot on an unknown outcome and drops the observation",
+        function()
+            local limiter, dict = fresh_env()
+            assert.True(limiter:try_acquire())
+            assert.True(limiter:release(0.1, "totally_broken"))
+            -- the slot never leaks over a typo; the sample is not recorded
+            assert.are.equal(0, limiter._inflight)
+            assert.are.equal(0, dict._data["al:1:payments:inflight"])
+            assert.are.equal(0, limiter.stats.completions)
+            assert.are.equal(1, limiter.anomalies.bad_outcome)
+        end)
 
     it("does not sample malformed latency but still releases", function()
         local limiter = fresh_env()

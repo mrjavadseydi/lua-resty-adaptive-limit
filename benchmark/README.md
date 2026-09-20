@@ -8,14 +8,14 @@ numbers reproducible and emphasize baseline comparisons over absolute figures.
 
 - **Load generator**: wrk 4.2.0 (`-t2 -c64`), 3 repetitions of 15 s per
   scenario, **median** reported. Single runs on a shared VM swing by more
-  than 10%; medians tame that without hiding it (all raw repetitions are
-  in `results/<run-id>/`).
+  than 10%; medians tame that without hiding it (every repetition's number is
+  listed in `results/<run-id>/summary.txt`).
 - **Every scenario is compared against a no-limiter baseline** with an
   identical request shape (`access`-shaped phase chain, 1 ms simulated
   upstream).
 - `fixed` is a minimal fixed shared-dict concurrency counter — the same
   admission shape as `resty.limit.conn` — isolating the cost of the
-  adaptive machinery above the shared-dict floor (the §69 comparison).
+  adaptive machinery above the shared-dict floor.
 - Micro-benchmark (`microbench.lua`) measures per-operation cost inside
   OpenResty over 200k operations, including the raw `get`+`incr` dict
   floor for reference.
@@ -31,8 +31,8 @@ numbers reproducible and emphasize baseline comparisons over absolute figures.
 | `fixed-wN` | fixed counter | 10^6 | 1 ms | shared-dict admission floor |
 | `adaptive-huge-wN` | adaptive | 10^5 | 1 ms | pure admission cost, no rejections |
 | `adaptive-tiny-wN` | adaptive | 2 | 1 ms | heavy-rejection path (incr+rollback) |
-| `adaptive-ctrl-wN` | adaptive | 20→40 | 1 ms | controller active + shedding |
-| `adaptive-ctrl5ms-w4` | adaptive | 20→40 | 5 ms | controller shedding a slower upstream |
+| `adaptive-ctrl-wN` | adaptive | 40 | 1 ms | controller active + shedding |
+| `adaptive-ctrl5ms-w4` | adaptive | 40 | 5 ms | controller shedding a slower upstream |
 | `adaptive-many16-wN` | adaptive ×16 | 10^5 | 1 ms | scheduler cost with 16 limiters |
 
 ## Running

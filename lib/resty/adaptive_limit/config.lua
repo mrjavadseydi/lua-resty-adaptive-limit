@@ -69,6 +69,23 @@ local UPSTREAM_CHOICES = {
 local NAME_PATTERN = "^%l[%l%d%.%-%_]*$"
 local NAME_MAX = 63
 
+-- Every option build() reads. Anything else is a typo (initial_limti)
+-- that would otherwise silently activate the default.
+local KNOWN = {}
+for _, k in ipairs({
+    "name", "shared_dict", "algorithm", "profile", "failure_mode",
+    "latency_source", "upstream_time_choice", "rejection_status",
+    "retry_after", "stale_threshold", "allow_internal", "on_update",
+    "on_anomaly", "outcome_classifier", "min_limit", "max_limit",
+    "initial_limit", "sample_window", "aggregation_grace", "min_samples",
+    "rtt_tolerance", "min_gradient", "smoothing", "headroom_min",
+    "headroom_max", "baseline_alpha", "sample_alpha",
+    "overload_min_samples", "overload_failure_ratio", "overload_backoff",
+    "aimd_increment", "aimd_decrease",
+}) do
+    KNOWN[k] = true
+end
+
 local function fail(msg)
     return "adaptive_limit config: " .. msg
 end
@@ -88,6 +105,11 @@ end
 function _M.build(user)
     if type(user) ~= "table" then
         return nil, fail("options table required")
+    end
+    for k in pairs(user) do
+        if not KNOWN[k] then
+            return nil, fail("unknown option \"" .. tostring(k) .. "\"")
+        end
     end
 
     local name = user.name

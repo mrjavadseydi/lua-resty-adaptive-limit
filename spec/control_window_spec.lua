@@ -146,6 +146,57 @@ describe("control_window measurement validation", function()
             assert.are.equal(5, dict:get("al:1:pay:limit"))
         end)
 
+    it("drops a corrupt shared long_rtt instead of re-rejecting it every window",
+        function()
+            local limiter = fresh_limiter()
+            local dict = ngx.shared.adaptive_limit
+            dict:set("al:1:pay:long_rtt", "corrupt_string")
+
+            for _ = 1, 25 do
+                assert.True(limiter:try_acquire())
+                assert.True(limiter:release(0.010, "success"))
+            end
+            limiter:flush(1005)
+            assert.True(limiter:control_window(100, 1015))
+            assert.are.equal(1, limiter.internal_errors)
+            -- the repair published nil: the corrupt key is gone
+            assert.is_nil(dict:get("al:1:pay:long_rtt"))
+
+            -- the next window is clean: no second internal error
+            for _ = 1, 25 do
+                assert.True(limiter:try_acquire())
+                assert.True(limiter:release(0.010, "success"))
+            end
+            limiter:flush(1015)
+            assert.True(limiter:control_window(101, 1025))
+            assert.are.equal(1, limiter.internal_errors)
+            assert.is_near(0.010, dict:get("al:1:pay:long_rtt"), 1e-9)
+        end)
+
+    it("keeps the window when publication fails so it is retried", function()
+        local limiter = fresh_limiter()
+        local dict = ngx.shared.adaptive_limit
+        for _ = 1, 25 do
+            assert.True(limiter:try_acquire())
+            assert.True(limiter:release(0.010, "success"))
+        end
+        limiter:flush(1005)
+
+        local set = dict.set
+        dict.set = function(d, key, ...)
+            if key == "al:1:pay:limit" then
+                return nil, "no memory"
+            end
+            return set(d, key, ...)
+        end
+        assert.falsy(limiter:control_window(100, 1015))
+        dict.set = set
+        assert.are.equal(1, limiter.internal_errors)
+        -- last_window did not advance and the accumulators survived
+        assert.are.equal(0, dict:get("al:1:pay:last_window"))
+        assert.are.equal(25, dict:get(win_key(100, "c")))
+    end)
+
     it("adopt_shared_state clamps adopted limit into [min_limit, max_limit]",
         function()
             fresh_limiter()

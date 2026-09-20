@@ -8,7 +8,8 @@ local ut = require("resty.adaptive_limit.upstream_time")
 -- pure controller math
 local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
 local ns = assert(common.safe_update(g2, state,
-    { sample_count = 1000, mean_rtt = 0.020 },
+    { sample_count = 1000, mean_rtt = 0.020, completions = 1000,
+      rejected_count = 1 },
     { min_samples = 20, sample_alpha = 0.5, baseline_alpha = 0.05,
       rtt_tolerance = 2.0, min_gradient = 0.5, smoothing = 0.5,
       headroom_min = 1, headroom_max = 50, min_limit = 1, max_limit = 2000,

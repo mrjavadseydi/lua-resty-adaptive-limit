@@ -7,6 +7,7 @@
 -- Key layout (prefix = "al:<schema>:<name>:"):
 --   limit, inflight, long_rtt, short_rtt, gradient,
 --   last_window, last_update   — permanent controller state
+--   last_completion            — newest completion time across workers
 --   w:<n>:c|s|ovl|tmo|err|abt|rej|cmp — per-window aggregate accumulators;
 --       every writer uses atomic incr (init 0), so flushes from any
 --       number of workers are race-free by construction. Keys carry an
@@ -51,6 +52,8 @@ function _M.new(dict, name)
         gradient    = prefix .. "gradient",
         last_window = prefix .. "last_window",
         last_update = prefix .. "last_update",
+        -- newest completion time seen by any worker (stuck diagnostics)
+        last_completion = prefix .. "last_completion",
     }
 
     local state = {
@@ -175,29 +178,50 @@ function _M:read_controller_state()
     return cs
 end
 
+-- Returns true, or nil + the first dict error. last_window is written
+-- LAST: if a write fails (no memory) or the worker dies mid-publish,
+-- last_window lags and the window is simply processed again — at worst
+-- one extra smoothing step on values that are clamped and finite either
+-- way. (Writing last_window first instead would skip the window; both
+-- failure orders are bounded, the repeated-update order keeps more
+-- signal.)
 function _M:publish_controller_state(limit_f, long_rtt, short_rtt, gradient,
                                      last_window, now)
     local dict = self.dict
     local K = self.K
-    -- The published integer limit follows the float state; last_window is
-    -- written LAST. If the worker dies mid-publish, last_window lags and
-    -- the window is simply processed again — at worst one extra smoothing
-    -- step on values that are clamped and finite either way. (Writing
-    -- last_window first instead would skip the window; both failure
-    -- orders are bounded, the repeated-update order keeps more signal.)
-    dict:set(K.limit_f, limit_f)
-    dict:set(K.limit, math.floor(limit_f))
-    if long_rtt ~= nil then
-        dict:set(K.long_rtt, long_rtt)
-    end
-    if short_rtt ~= nil then
-        dict:set(K.short_rtt, short_rtt)
+    -- nil RTT state means "no valid value" (not seeded yet, or dropped by
+    -- repair_state): the key must go, or a corrupt foreign value would
+    -- be read back and rejected again on every window.
+    local function put(key, value)
+        if value == nil then
+            return dict:delete(key)
+        end
+        return dict:set(key, value)
     end
     if gradient ~= nil then
+        -- diagnostics only; kept across held windows (which carry none)
         dict:set(K.gradient, gradient)
     end
-    dict:set(K.last_update, now)
-    dict:set(K.last_window, last_window)
+    local ok, err = put(K.limit_f, limit_f)
+    if ok then ok, err = put(K.limit, math.floor(limit_f)) end
+    if ok then ok, err = put(K.long_rtt, long_rtt) end
+    if ok then ok, err = put(K.short_rtt, short_rtt) end
+    if ok then ok, err = put(K.last_update, now) end
+    if ok then ok, err = put(K.last_window, last_window) end
+    if not ok then
+        return nil, err
+    end
+    return true
+end
+
+-- Monotonic max of the newest completion time; control path, once per
+-- tick per worker. The get/set pair races benignly (two workers can
+-- only publish values within one tick of each other).
+function _M:publish_last_completion(t)
+    local cur = self.dict:get(self.K.last_completion)
+    if type(cur) ~= "number" or t > cur then
+        self.dict:set(self.K.last_completion, t)
+    end
 end
 
 return _M
