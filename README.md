@@ -104,6 +104,17 @@ concurrency: 150 latency: 40 ms      queue forming → limit stops growing
 concurrency: 180 latency: 120 ms     saturation → limit shrinks, load shed
 ```
 
+The baseline the controller compares against is learned only while the
+limit is *not* the bottleneck (windows without rejections). Under
+saturation the limit itself shapes the latency, so learning from those
+windows would normalize the queue and ratchet the limit up until failures
+appear; instead, every `probe_interval` windows (30 s by default) the
+limit is published at `probe_fraction` (half) for two windows and the
+baseline is re-measured from the second — the same idea as Envoy's
+adaptive-concurrency minRTT recalculation and BBR's PROBE_RTT. Expect a
+short, periodic dip in the published limit under sustained saturation;
+`state().probe_restore` shows the limit it will return to.
+
 Two planes, strictly separated:
 
 **Fast path** (per request): read the current limit, take one atomic
@@ -238,7 +249,8 @@ maps `"rejected"` to the configured status (503 by default) with a
 
 *Yields:* no; performs a handful of shared-dict reads — **not** for the
 request path. Returns shared state (`limit`, `float_limit`, `inflight`,
-`short_rtt`, `long_rtt`, `gradient`, `last_window`, `last_update`, last
+`short_rtt`, `long_rtt`, `gradient`, `probe_restore` (set only during a
+baseline probe), `last_window`, `last_update`, last
 closed window's raw accumulators — note: accumulators are deleted once
 processed, so `last_sample_count` is non-zero only during the grace window),
 worker-local counters (`admitted_total`, `rejected_total`, `controller_updates`,
@@ -295,11 +307,13 @@ Explicit options override `profile`; profiles are only pre-tuned bundles
 | `min_gradient` | number | 0.5 | `(0, 1)`; floor on per-window decrease |
 | `smoothing` | number | 0.5 | `(0, 1]`; limit EWMA factor |
 | `headroom_min`/`headroom_max` | number | 1 / 50 | bounds of the `sqrt(limit)` growth pressure |
-| `baseline_alpha` | number | 0.05 | `(0, 1)`; baseline EWMA speed (slow by design) |
+| `baseline_alpha` | number | 0.05 | `(0, 1)`; baseline EWMA speed on app-limited windows (slow by design) |
 | `sample_alpha` | number | 0.5 | `(0, 1]`; observed-RTT EWMA speed |
 | `overload_min_samples` | integer | 20 | minimum completed outcomes before explicit-signal backoff may trigger |
 | `overload_failure_ratio` | number | 0.10 | `(0, 1]`; strong-signal/completion ratio that triggers backoff and freezes the baseline |
 | `overload_backoff` | number | 0.80 | `(0, 1)`; multiplicative backoff |
+| `probe_interval` | integer | 30 | windows between baseline probes under saturation (`>= 3`; `0` disables) |
+| `probe_fraction` | number | 0.5 | `(0, 1)`; limit published during the two probe windows |
 | `latency_source` | string | `"request_time"` | \| `upstream_response_time` \| `manual` |
 | `upstream_time_choice` | string | `"last"` | `last` \| `max` \| `sum` for multi-attempt upstream timings |
 | `allow_internal` | boolean | false | admit on `ngx.req.is_internal()` (exec-fronted locations) |
@@ -331,9 +345,19 @@ raises `limit_missing` anomalies rather than admitting unbounded.
   corruption): re-seeded from the worker's last observed limit — fresh to
   within one window — with a `limit_missing`/`limit_corrupted` anomaly;
   a limit outside `[min_limit, max_limit]` (including `inf`) is treated
-  the same way; a non-numeric, non-finite or negative `inflight` counter
-  is snapped to what this worker knows it holds (`inflight_corrupted`) —
-  `-inf + 1` must never admit.
+  the same way. An `inflight` counter that vanished under memory pressure
+  (OpenResty may evict unexpired keys) is **not** recreated from zero —
+  that would forget every held slot: it is rebuilt from this worker's own
+  held count (`inflight_missing` anomaly; the discovering acquire fails as
+  an internal error under `failure_mode`), and sibling workers' earlier
+  admissions reconcile as they drain. A corrupted `inflight` counter (non-numeric or
+  non-finite — `-inf + 1` must never admit) is **not** auto-repaired: the
+  library cannot know how many slots other workers hold, and an
+  unsynchronized reset would erase their admissions. It is surfaced
+  (`inflight_corrupted` anomaly, rate-limited error log) and treated as
+  an internal error under `failure_mode` until an operator resets the
+  key with traffic quiesced:
+  `ngx.shared.<zone>:set("al:1:<name>:inflight", 0)`.
   The limiter never crashes a request comparing against garbage.
 * **Graceful reload (`nginx -s reload`)**: the shared dictionary
   survives; new workers validate the schema marker and adopt the learned

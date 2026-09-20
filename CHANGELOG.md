@@ -6,6 +6,20 @@ All notable changes are documented here. Format based on
 
 ## [Unreleased]
 
+### Fixed
+- Controller: the latency baseline no longer learns from saturated windows,
+  which normalized sustained congestion and ratcheted the limit to
+  `max_limit` when the backend queued without failing (simulation I).
+  Under saturation the baseline is re-measured by a periodic probe
+  (`probe_interval`, `probe_fraction`; new `probe_restore` state key).
+- Admission: an evicted `inflight` counter is rebuilt from this worker's
+  held slots instead of zero (`inflight_missing` anomaly), so the cap
+  survives shared-dict memory pressure.
+- Controller: a window superseded by a sibling after the lease is abandoned
+  (`stale_controller_window`) instead of publishing older state.
+- `t/controller.t` asserts actual growth, shedding, recovery and the
+  hand-computed single-update value; a frozen controller now fails it.
+
 ## [0.1.0] — 2026-09-20
 
 ### Added

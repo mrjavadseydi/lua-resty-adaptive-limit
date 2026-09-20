@@ -11,6 +11,7 @@
 
 local clamp = require("resty.adaptive_limit.util.clamp")
 local ewma = require("resty.adaptive_limit.util.ewma")
+local common = require("resty.adaptive_limit.controller.common")
 
 local _M = {
     name = "aimd",
@@ -27,6 +28,11 @@ function _M.update(state, m, cfg)
         and failure_count / completions > cfg.overload_failure_ratio
     local strong_overload = overloaded
         and completions >= cfg.overload_min_samples
+
+    local probe = common.probe_step(state, m, cfg, overloaded)
+    if probe then
+        return probe
+    end
 
     if sc < cfg.min_samples and not strong_overload then
         return {
@@ -45,10 +51,12 @@ function _M.update(state, m, cfg)
         short_rtt = ewma(short_rtt, m.mean_rtt, cfg.sample_alpha)
     end
 
-    -- baseline frozen on congested windows, the first one included (see
-    -- gradient2.lua): never learn an overloaded RTT as healthy
+    -- baseline frozen on congested and on saturated windows, the first
+    -- one included (see gradient2.lua): never learn an overloaded RTT
+    -- as healthy, never normalize a queue the limit itself caused
     local long_rtt = state.long_rtt
-    if sc >= cfg.min_samples and not overloaded then
+    if sc >= cfg.min_samples and not overloaded
+        and (m.rejected_count == 0 or long_rtt == nil) then
         long_rtt = ewma(long_rtt, short_rtt, cfg.baseline_alpha)
     end
 
@@ -73,13 +81,13 @@ function _M.update(state, m, cfg)
 
     next_limit = clamp(next_limit, cfg.min_limit, cfg.max_limit)
 
-    return {
+    return common.probe_start({
         limit = next_limit,
         long_rtt = long_rtt,
         short_rtt = short_rtt,
         gradient = congested and 0 or 1,
         held = false,
-    }
+    }, m, cfg)
 end
 
 return _M

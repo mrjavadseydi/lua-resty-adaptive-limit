@@ -1,4 +1,4 @@
--- Deterministic controller simulations (design.md §14, scenarios A–H).
+-- Deterministic controller simulations (design.md §14, scenarios A–I).
 --
 -- Backend model: fixed capacity C and base RTT R with a queueing knee —
 --   rtt(A)   = R * (1 + 8 * max(0, A - C) / C)          (A = admitted concurrency)
@@ -38,6 +38,8 @@ local function sim_cfg()
         overload_min_samples = 20,
         overload_failure_ratio = 0.10,
         overload_backoff = 0.80,
+        probe_interval = 30,
+        probe_fraction = 0.5,
         aimd_increment = 1,
         aimd_decrease = 0.8,
     }
@@ -58,6 +60,8 @@ function sim.new(opts)
     self.limit = opts.initial_limit
     self.float_limit = opts.initial_limit
     self.demand = opts.demand
+    self.no_timeouts = opts.no_timeouts
+    self.window = 0
     self.long_rtt = nil
     self.short_rtt = nil
     self.history = {}
@@ -76,7 +80,7 @@ function sim:step()
 
     -- queue formation degrades into timeouts past 1.3x capacity
     local tmo_ratio = 0
-    if admitted > self.capacity * 1.3 then
+    if not self.no_timeouts and admitted > self.capacity * 1.3 then
         tmo_ratio = math.min(0.4, admitted / self.capacity - 1.3)
     end
     local timeouts = math.floor(completions * tmo_ratio)
@@ -85,33 +89,40 @@ function sim:step()
     -- jitter on the observed mean
     local mean = rtt * (1 + (self.rand(11) - 5) / 100)
 
+    self.window = self.window + 1
     local m = {
         sample_count = ok_completions,
         mean_rtt = mean,
         timeout_count = timeouts,
         completions = completions,
         rejected_count = self.demand > self.limit and 1 or 0,
+        window = self.window,
     }
     local state = {
         limit = self.float_limit,
         long_rtt = self.long_rtt,
         short_rtt = self.short_rtt,
+        probe_restore = self.probe_restore,
     }
     local next_state = assert(common.safe_update(self.alg, state, m, self.cfg),
         "simulation produced an invalid controller update")
     self.float_limit = next_state.limit
     self.long_rtt = next_state.long_rtt
     self.short_rtt = next_state.short_rtt
+    self.probe_restore = next_state.probe_restore
     self.limit = math.floor(next_state.limit)
-    self.history[#self.history + 1] = self.limit
-    return self.limit
+    -- assertions look at the limit the controller is steering, not at
+    -- the two-window probe dips (unit-tested in gradient2_spec)
+    self.eff = math.floor(next_state.probe_restore or next_state.limit)
+    self.history[#self.history + 1] = self.eff
+    return self.eff
 end
 
 function sim:run(windows)
     for _ = 1, windows do
         self:step()
     end
-    return self.limit
+    return self.eff
 end
 
 local function assert_gradual(history, max_jump_frac)
@@ -150,12 +161,12 @@ describe("simulation B: capacity suddenly halves", function()
         local s = sim.new({ capacity = 100, demand = 200, initial_limit = 120,
             seed = 22 })
         s:run(30) -- settle
-        local before = s.limit
+        local before = s.eff
         s.capacity = 50
         local shed_at
         for i = 1, 30 do
             s:step()
-            if not shed_at and s.limit <= before * 0.75 then
+            if not shed_at and s.eff <= before * 0.75 then
                 shed_at = i
             end
         end
@@ -184,7 +195,7 @@ describe("simulation C: capacity doubles", function()
         local reached
         for i = 1, 60 do
             s:step()
-            if not reached and s.limit >= 90 then
+            if not reached and s.eff >= 90 then
                 reached = i
             end
         end
@@ -198,7 +209,7 @@ describe("simulation D: single latency outlier", function()
         local s = sim.new({ capacity = 100, demand = 120, initial_limit = 100,
             seed = 44 })
         s:run(20)
-        local before = s.limit
+        local before = s.eff
         -- one 5s outlier among thousands of healthy completions
         local m = {
             sample_count = 5000,
@@ -220,22 +231,22 @@ describe("simulation E: timeout storm", function()
         local s = sim.new({ capacity = 100, demand = 250, initial_limit = 200,
             seed = 55 })
         s:run(10)
-        local before = s.limit
+        local before = s.eff
         -- the storm: demand spikes deep into the timeout zone
         s.demand = 800
         local min_seen = before
         for i = 1, 5 do
             s:step()
-            min_seen = math.min(min_seen, s.limit)
+            min_seen = math.min(min_seen, s.eff)
         end
         -- backoff + gradient shedding must pull the limit down (the
         -- exact backoff arithmetic itself is unit-tested in
         -- gradient2_spec); once below the knee the controller stops
         -- shedding, so a sustained collapse is NOT the expected shape
         assert.True(min_seen < before * 0.95,
-            "storm did not shed: " .. before .. " -> " .. s.limit)
-        assert.True(s:rtt(s.limit) <= s.base * 5,
-            "post-storm rtt out of band: " .. s:rtt(s.limit) / s.base .. "x base")
+            "storm did not shed: " .. before .. " -> " .. s.eff)
+        assert.True(s:rtt(s.eff) <= s.base * 5,
+            "post-storm rtt out of band: " .. s:rtt(s.eff) / s.base .. "x base")
     end)
 end)
 
@@ -245,7 +256,7 @@ describe("simulation F: low traffic", function()
         local s = sim.new({ capacity = 100, demand = 0.04, initial_limit = 80,
             seed = 66 })
         s:run(50)
-        assert.are.equal(80, s.limit)
+        assert.are.equal(80, s.eff)
     end)
 end)
 
@@ -254,16 +265,16 @@ describe("simulation G: idle then burst", function()
         local s = sim.new({ capacity = 100, demand = 100, initial_limit = 90,
             seed = 77 })
         s:run(20)
-        local settled = s.limit
+        local settled = s.eff
         s.demand = 0
         s:run(300) -- five minutes idle
-        assert.are.equal(settled, s.limit) -- nothing drifts while idle
+        assert.are.equal(settled, s.eff) -- nothing drifts while idle
         s.demand = 1000
         for i = 1, 10 do
             s:step()
             -- even with heavy demand, growth stays headroom-bounded
-            assert.True(s.limit <= settled * 2,
-                "uncontrolled jump to " .. s.limit)
+            assert.True(s.eff <= settled * 2,
+                "uncontrolled jump to " .. s.eff)
         end
     end)
 end)
@@ -275,13 +286,50 @@ describe("simulation H: permanently slower backend", function()
         s:run(20)
         s.base = 0.035 -- the service legitimately becomes slower
         s:run(120)
-        assert.True(s.limit >= 40,
-            "collapsed to minimum: " .. s.limit)
-        assert.True(s.limit <= 300,
-            "ran away: " .. s.limit)
+        assert.True(s.eff >= 40,
+            "collapsed to minimum: " .. s.eff)
+        assert.True(s.eff <= 300,
+            "ran away: " .. s.eff)
         -- the baseline must have learned the new normal
         assert.True(s.long_rtt ~= nil and s.long_rtt > 0.025,
             "baseline never adapted: " .. tostring(s.long_rtt))
+    end)
+end)
+
+describe("simulation I: sustained congestion without failures", function()
+    -- The backend queues but never fails: no timeouts, no 503s. Latency
+    -- is the only congestion signal. A baseline that learns from
+    -- saturated windows normalizes the queue and ratchets the limit to
+    -- max_limit (2000 by window 180, ~3 s latency, with the pre-probe
+    -- controller); the promise "shed before failures" rests on this
+    -- scenario.
+    local function run(alg)
+        local s = sim.new({ algorithm = alg, capacity = 100, demand = 5000,
+            initial_limit = 20, no_timeouts = true, seed = 111 })
+        s:run(300)
+        return s
+    end
+
+    it("gradient2 stops growing near the capacity knee", function()
+        local s = run(g2)
+        for i = #s.history - 59, #s.history do
+            local l = s.history[i]
+            assert.True(l <= 150, "window " .. i .. " ratcheted to " .. l)
+            assert.True(s:rtt(l) <= s.base * 5,
+                "window " .. i .. " latency " .. s:rtt(l) / s.base .. "x base")
+        end
+        assert.True(s.eff >= 80, "collapsed to " .. s.eff)
+        assert.True(s.long_rtt < s.base * 1.2,
+            "baseline normalized the queue: " .. s.long_rtt)
+    end)
+
+    it("aimd stops growing near the capacity knee", function()
+        local s = run(aimd)
+        for i = #s.history - 59, #s.history do
+            assert.True(s.history[i] <= 150,
+                "window " .. i .. " ratcheted to " .. s.history[i])
+        end
+        assert.True(s.eff >= 80, "collapsed to " .. s.eff)
     end)
 end)
 
@@ -291,8 +339,10 @@ describe("simulation: AIMD comparison on scenario B", function()
             initial_limit = 120, seed = 99 })
         s:run(30)
         s.capacity = 50
-        s:run(30)
-        assert.True(s:rtt(s.limit) <= s.base * 3,
-            "AIMD failed to shed below the knee")
+        -- initial 120 > capacity seeded a congested baseline; the probe
+        -- at window 60 re-measures it, then AIMD sheds below the knee
+        s:run(35)
+        assert.True(s:rtt(s.eff) <= s.base * 3,
+            "AIMD failed to shed below the knee: " .. s.eff)
     end)
 end)

@@ -81,7 +81,7 @@ for _, k in ipairs({
     "rtt_tolerance", "min_gradient", "smoothing", "headroom_min",
     "headroom_max", "baseline_alpha", "sample_alpha",
     "overload_min_samples", "overload_failure_ratio", "overload_backoff",
-    "aimd_increment", "aimd_decrease",
+    "probe_interval", "probe_fraction", "aimd_increment", "aimd_decrease",
 }) do
     KNOWN[k] = true
 end
@@ -291,6 +291,22 @@ function _M.build(user)
     if not finite_number(cfg.overload_backoff) or cfg.overload_backoff <= 0
         or cfg.overload_backoff >= 1 then
         return nil, fail("overload_backoff must be in (0, 1)")
+    end
+
+    -- baseline probe under saturation (controller.common): every
+    -- probe_interval windows, two windows at limit * probe_fraction;
+    -- 0 disables probing (the baseline then only learns while
+    -- app-limited)
+    cfg.probe_interval = opt("probe_interval", 30)
+    if cfg.probe_interval ~= 0 then
+        err = integer_in_range(cfg.probe_interval, "probe_interval", 3, 2 ^ 31)
+        if err then return nil, err end
+    end
+
+    cfg.probe_fraction = opt("probe_fraction", 0.5)
+    if not finite_number(cfg.probe_fraction) or cfg.probe_fraction <= 0
+        or cfg.probe_fraction >= 1 then
+        return nil, fail("probe_fraction must be in (0, 1)")
     end
 
     -- aimd-specific

@@ -42,6 +42,11 @@ function _M.validate_state(state, cfg)
     if rtt ~= nil and (type(rtt) ~= "number" or not _M.is_finite(rtt) or rtt < 0) then
         return nil, "invalid short_rtt"
     end
+    local pr = state.probe_restore
+    if pr ~= nil and (type(pr) ~= "number" or not _M.is_finite(pr)
+        or pr < cfg.min_limit or pr > cfg.max_limit) then
+        return nil, "invalid probe_restore"
+    end
     return true
 end
 
@@ -82,6 +87,11 @@ function _M.validate_measurement(m, cfg)
         return nil, "invalid outcome counts"
     end
 
+    local win = m.window
+    if win ~= nil and not is_count(win) then
+        return nil, "invalid window"
+    end
+
     local cmp = m.completions
     if cmp ~= nil then
         if not is_count(cmp) then
@@ -105,7 +115,66 @@ function _M.validate_measurement(m, cfg)
         aborted_count = abt,
         rejected_count = rej,
         completions = cmp,
+        window = win,
     }
+end
+
+-- Baseline probe (design.md §8). Under saturated demand (rejections in
+-- the window) the limit itself shapes the observed latency, so a baseline
+-- learned from such windows normalizes the very queue the controller is
+-- supposed to shed: gradient 1.0, headroom growth, more queue, higher
+-- baseline — a ratchet that only failures stop. Both controllers
+-- therefore learn the baseline only from app-limited windows, and under
+-- saturation re-measure it by probing: every probe_interval windows the
+-- limit is published at limit * probe_fraction for two windows; the
+-- first is polluted by requests admitted under the old limit (the
+-- publish lands aggregation_grace into it), the second is the clean
+-- measurement and re-seeds the baseline. Window phases come from the
+-- shared window number, so every worker agrees without extra state.
+--
+-- probe_step(state, m, cfg, overloaded) returns the complete next state
+-- when this window belongs to a probe (the caller returns it as-is), or
+-- nil when the normal update runs. probe_start(next_state, m, cfg)
+-- turns a normal update into the start of a probe when one is due.
+function _M.probe_step(state, m, cfg, overloaded)
+    local restore = state.probe_restore
+    local interval = cfg.probe_interval or 0
+    if restore == nil or interval <= 0 or m.window == nil then
+        return nil
+    end
+    if m.window % interval == 1 then
+        -- polluted window: hold the probe limit, learn nothing
+        return {
+            limit = state.limit,
+            long_rtt = state.long_rtt,
+            short_rtt = state.short_rtt,
+            gradient = state.gradient,
+            probe_restore = restore,
+            held = true,
+        }
+    end
+    local long_rtt = state.long_rtt
+    if m.sample_count >= cfg.min_samples and not overloaded then
+        long_rtt = m.mean_rtt
+    end
+    return {
+        limit = restore,
+        long_rtt = long_rtt,
+        short_rtt = state.short_rtt,
+        gradient = state.gradient,
+        held = false,
+    }
+end
+
+function _M.probe_start(next_state, m, cfg)
+    local interval = cfg.probe_interval or 0
+    if interval > 0 and m.window ~= nil and m.window % interval == 0
+        and m.rejected_count > 0 and next_state.long_rtt ~= nil then
+        next_state.probe_restore = next_state.limit
+        next_state.limit = math.max(cfg.min_limit,
+            next_state.limit * cfg.probe_fraction)
+    end
+    return next_state
 end
 
 -- Repair a state table that failed validate_state (or wraps a limit whose
@@ -143,8 +212,15 @@ function _M.repair_state(state, cfg)
         repaired = true
     end
 
-    return { limit = limit, long_rtt = long_rtt, short_rtt = short_rtt },
-        repaired
+    local pr = state.probe_restore
+    if pr ~= nil and (type(pr) ~= "number" or not _M.is_finite(pr)
+        or pr < cfg.min_limit or pr > cfg.max_limit) then
+        pr = nil
+        repaired = true
+    end
+
+    return { limit = limit, long_rtt = long_rtt, short_rtt = short_rtt,
+        probe_restore = pr }, repaired
 end
 
 -- safe_update(algorithm, state, measurement, cfg) -> next_state | nil, err

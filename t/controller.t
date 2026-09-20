@@ -50,8 +50,8 @@ location /limit {
 --- response_body_like eval
 [
     qr/^done$/,
-    qr/^limit=\d+$/,
-    qr/^limit=([1-9][0-9]{1,}|100)$/
+    qr/^limit=(1[1-9]|[2-9]\d|100)$/,
+    qr/^limit=(1[1-9]|[2-9]\d|100)$/
 ]
 --- no_error_log
 [error]
@@ -120,13 +120,33 @@ location /limit {
         ngx.say("limit=", limit)
     }
 }
+location /recover {
+    content_by_lua_block {
+        -- healthy saturated traffic (one rejection per burst proves the
+        -- demand reached the cap) must grow the limit back above the
+        -- shed value within the deadline
+        local d = ngx.shared.adaptive_limit
+        local shed = tonumber(d:get("al:1:pay:limit"))
+        local t0 = ngx.now()
+        local limit = shed
+        while limit <= shed and ngx.now() - t0 < 5 do
+            local held = 0
+            while PAY:try_acquire() do held = held + 1 end
+            for _ = 1, held do assert(PAY:release(0.020, "success")) end
+            ngx.sleep(0.02)
+            limit = tonumber(d:get("al:1:pay:limit"))
+        end
+        ngx.say(limit > shed and "recovered" or "stuck at " .. limit)
+    }
+}
 --- request eval
-["GET /work", "GET /work", "GET /limit"]
+["GET /work", "GET /work", "GET /limit", "GET /recover"]
 --- response_body_like eval
 [
     qr/^done$/,
     qr/^done$/,
-    qr/^limit=\d+$/,
+    qr/^limit=([1-9]|[1-4]\d)$/,
+    qr/^recovered$/,
 ]
 --- no_error_log
 [error]
@@ -152,22 +172,26 @@ location /control {
         -- closed and past the grace period; three identical passes must
         -- process it exactly once
         for i = 1, 3 do
-            for j = 1, 30 do
-                assert(PAY:try_acquire())
-                assert(PAY:release(0.020, "success"))
+            for j = 1, 3 do
+                -- fill to the cap: the rejection allows growth
+                local held = 0
+                while PAY:try_acquire() do held = held + 1 end
+                for k = 1, held do assert(PAY:release(0.020, "success")) end
             end
             PAY:flush(100.0)
             PAY:control(100.5)
         end
+        -- one update: 10 * 0.5 + (10 * 1.0 + sqrt(10)) * 0.5 = 11.58 -> 11;
+        -- a second pass would have published 13
         ngx.say("updates=", tonumber(PAY.controller_updates) or 0)
         ngx.say("limit=", ngx.shared.adaptive_limit:get("al:1:pay:limit"))
     }
 }
 --- request
 GET /control
---- response_body_like
-^updates=1
-limit=([1-9]\d+)$
+--- response_body
+updates=1
+limit=11
 --- no_error_log
 [error]
 
@@ -223,7 +247,7 @@ location /limit {
 --- response_body_like eval
 [
     qr/^done$/,
-    qr/^pay=([1-9][0-9]+|100) search=([1-9][0-9]+|100)$/
+    qr/^pay=(1[1-9]|[2-9]\d|100) search=(1[1-9]|[2-9]\d|100)$/
 ]
 --- no_error_log
 [error]

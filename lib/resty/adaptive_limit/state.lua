@@ -5,7 +5,7 @@
 -- admission touches exactly K_limit and K_inflight.
 --
 -- Key layout (prefix = "al:<schema>:<name>:"):
---   limit, inflight, long_rtt, short_rtt, gradient,
+--   limit, inflight, long_rtt, short_rtt, gradient, probe_restore,
 --   last_window, last_update   — permanent controller state
 --   lc:<worker_id>             — that worker's newest completion time
 --   w:<n>:c|s|ovl|tmo|err|abt|rej|cmp — per-window aggregate accumulators;
@@ -50,6 +50,7 @@ function _M.new(dict, name)
         long_rtt    = prefix .. "long_rtt",
         short_rtt   = prefix .. "short_rtt",
         gradient    = prefix .. "gradient",
+        probe_restore = prefix .. "probe_restore", -- set only mid-probe
         last_window = prefix .. "last_window",
         last_update = prefix .. "last_update",
     }
@@ -163,9 +164,9 @@ function _M:read_controller_state()
     local K = self.K
     local cs = {}
     local fields = { "limit", "limit_f", "long_rtt", "short_rtt",
-        "last_window" }
+        "probe_restore", "last_window" }
     local keys = { K.limit, K.limit_f, K.long_rtt, K.short_rtt,
-        K.last_window }
+        K.probe_restore, K.last_window }
     for i = 1, #fields do
         local v, err = dict:get(keys[i])
         if v == nil and err and err ~= "not found" then
@@ -184,7 +185,7 @@ end
 -- failure orders are bounded, the repeated-update order keeps more
 -- signal.)
 function _M:publish_controller_state(limit_f, long_rtt, short_rtt, gradient,
-                                     last_window, now)
+                                     probe_restore, last_window, now)
     local dict = self.dict
     local K = self.K
     -- nil RTT state means "no valid value" (not seeded yet, or dropped by
@@ -204,6 +205,7 @@ function _M:publish_controller_state(limit_f, long_rtt, short_rtt, gradient,
     if ok then ok, err = put(K.limit, math.floor(limit_f)) end
     if ok then ok, err = put(K.long_rtt, long_rtt) end
     if ok then ok, err = put(K.short_rtt, short_rtt) end
+    if ok then ok, err = put(K.probe_restore, probe_restore) end
     if ok then ok, err = put(K.last_update, now) end
     if ok then ok, err = put(K.last_window, last_window) end
     if not ok then

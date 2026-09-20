@@ -173,6 +173,38 @@ describe("control_window measurement validation", function()
             assert.is_near(0.010, dict:get("al:1:pay:long_rtt"), 1e-9)
         end)
 
+    it("abandons a window a sibling already superseded after the lease", function()
+        local limiter = fresh_limiter({ max_limit = 100 })
+        local dict = ngx.shared.adaptive_limit
+        for _ = 1, 25 do
+            assert.True(limiter:try_acquire())
+            assert.True(limiter:release(0.010, "success"))
+        end
+        limiter:flush(1005)
+
+        -- this worker takes the lease on window 100, then stalls past
+        -- LEASE_TTL; a sibling re-leases, processes 100..102 and publishes
+        -- limit 42 at last_window 102 before we re-read the state
+        local st = limiter.st
+        local read_window = st.read_window
+        st.read_window = function(self, n)
+            st.read_window = read_window
+            local acc = read_window(self, n)
+            assert(st:publish_controller_state(42, 0.010, 0.010, 1.0, nil, 102, 1020))
+            st:delete_window(100)
+            return acc
+        end
+        assert.falsy(limiter:control_window(100, 1015))
+
+        -- nothing moved backwards: the sibling's publication stands
+        assert.are.equal(102, dict:get("al:1:pay:last_window"))
+        assert.are.equal(42, dict:get("al:1:pay:limit"))
+        assert.are.equal(1, limiter.controller_skips)
+        assert.are.equal(1, limiter.anomalies.stale_controller_window)
+        assert.are.equal(0, limiter.controller_updates or 0)
+        assert.are.equal(0, limiter.internal_errors)
+    end)
+
     it("keeps the window when publication fails so it is retried", function()
         local limiter = fresh_limiter()
         local dict = ngx.shared.adaptive_limit

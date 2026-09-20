@@ -13,19 +13,24 @@
 --   gradient  last computed gradient (diagnostics)
 --   held      true when the window produced no update (insufficient
 --             samples) — the wiring counts this as a skipped update
+--   probe_restore  the limit to return to after a baseline probe; nil
+--             outside probes (see controller.common)
 --
 -- Config fields used (flattened by the limiter's config builder):
 --   min_samples, sample_alpha, baseline_alpha, rtt_tolerance,
 --   min_gradient, smoothing, headroom_min, headroom_max, min_limit,
 --   max_limit, overload_min_samples, overload_failure_ratio,
---   overload_backoff
+--   overload_backoff, probe_interval, probe_fraction
 --
 -- Equations (per closed window):
 --   short'  = sample_alpha   * mean_rtt + (1 - sample_alpha)   * short
 --   long'   = baseline_alpha * short'  + (1 - baseline_alpha) * long
---             -- frozen on windows whose strong-signal ratio exceeds
---             -- overload_failure_ratio: an overload must not be
---             -- normalized into the baseline
+--             -- only on app-limited windows (no rejections): under
+--             -- saturation the limit shapes the latency, and learning
+--             -- it would normalize the queue (ratchet). Frozen as well
+--             -- on windows whose strong-signal ratio exceeds
+--             -- overload_failure_ratio. Under saturation the baseline
+--             -- is re-measured by the periodic probe instead.
 --   grad    = clamp(rtt_tolerance * long' / short', min_gradient, 1.0)
 --   head    = rejected_count > 0
 --             and clamp(sqrt(limit), headroom_min, headroom_max) or 0
@@ -41,6 +46,7 @@
 
 local clamp = require("resty.adaptive_limit.util.clamp")
 local ewma = require("resty.adaptive_limit.util.ewma")
+local common = require("resty.adaptive_limit.controller.common")
 
 local math_sqrt = math.sqrt
 local math_min = math.min
@@ -59,6 +65,11 @@ function _M.update(state, m, cfg)
     local overloaded = completions > 0
         and failure_count / completions > cfg.overload_failure_ratio
     local backoff = overloaded and completions >= cfg.overload_min_samples
+
+    local probe = common.probe_step(state, m, cfg, overloaded)
+    if probe then
+        return probe
+    end
 
     if sc < cfg.min_samples and not backoff then
         return {
@@ -87,8 +98,10 @@ function _M.update(state, m, cfg)
     -- first one: seeding it from an overloaded RTT (restart mid-incident)
     -- would teach the controller that the overload is "healthy". With no
     -- baseline yet the gradient stays 1.0 and only the overload backoff
-    -- acts; the first healthy window seeds it.
-    if sc >= cfg.min_samples and not overloaded then
+    -- acts; the first healthy window seeds it (even a saturated one:
+    -- without a baseline nothing bounds growth until the first probe).
+    if sc >= cfg.min_samples and not overloaded
+        and (m.rejected_count == 0 or long_rtt == nil) then
         long_rtt = ewma(long_rtt, short_rtt, cfg.baseline_alpha)
     end
 
@@ -117,13 +130,13 @@ function _M.update(state, m, cfg)
     local next_limit = limit * (1 - cfg.smoothing) + candidate * cfg.smoothing
     next_limit = clamp(next_limit, cfg.min_limit, cfg.max_limit)
 
-    return {
+    return common.probe_start({
         limit = next_limit,
         long_rtt = long_rtt,
         short_rtt = short_rtt,
         gradient = gradient,
         held = false,
-    }
+    }, m, cfg)
 end
 
 return _M

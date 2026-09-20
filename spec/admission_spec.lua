@@ -160,25 +160,83 @@ describe("admission", function()
         assert.are.equal(1, limiter.anomalies.negative_inflight)
     end)
 
-    it("treats a non-finite or negative inflight counter as corrupted", function()
-        for _, garbage in ipairs({ -math.huge, 0 / 0, -1e9, math.huge }) do
-            local limiter, dict = fresh_env()
-            dict._data["al:1:payments:inflight"] = garbage
-            -- -inf + 1 == -inf would otherwise admit forever
-            for _ = 1, 10 do
-                assert.True(limiter:try_acquire())
-            end
-            local ok, err = limiter:try_acquire()
-            assert.falsy(ok, tostring(garbage))
-            assert.are.equal(errors.REJECTED, err)
-            assert.are.equal(1, limiter.anomalies.inflight_corrupted)
-            assert.are.equal(10, dict._data["al:1:payments:inflight"])
-            -- release on a counter that went non-finite again snaps to 0
-            dict._data["al:1:payments:inflight"] = 0 / 0
-            assert.True(limiter:release(0.01))
-            assert.are.equal(0, dict._data["al:1:payments:inflight"])
-        end
+    it("rebuilds an evicted inflight counter from held slots instead of zero", function()
+        -- ngx.shared may evict unexpired keys under memory pressure: two
+        -- slots held at limit 2, the counter vanishes, a third acquire
+        -- must not become a third held slot on a counter reading 1
+        local limiter, dict = fresh_env({ initial_limit = 2, max_limit = 2 })
+        assert.True(limiter:try_acquire())
+        assert.True(limiter:try_acquire())
+        dict._data["al:1:payments:inflight"] = nil
+
+        local ok, err = limiter:try_acquire()
+        assert.falsy(ok)
+        assert.are.equal(errors.INTERNAL_ERROR, err)
+        assert.are.equal(1, limiter.anomalies.inflight_missing)
+        assert.are.equal(1, limiter.internal_errors)
+        assert.are.equal(2, limiter._inflight)
+        assert.are.equal(2, dict._data["al:1:payments:inflight"])
+        -- the rebuilt counter enforces the cap again
+        local rok, rerr = limiter:try_acquire()
+        assert.falsy(rok)
+        assert.are.equal(errors.REJECTED, rerr)
+        assert.True(limiter:release(0.010))
+        assert.True(limiter:try_acquire())
+        assert.are.equal(2, dict._data["al:1:payments:inflight"])
+
+        -- eviction discovered by a release: rebuilt, then released
+        dict._data["al:1:payments:inflight"] = nil
+        assert.True(limiter:release(0.010))
+        assert.are.equal(1, dict._data["al:1:payments:inflight"])
+        assert.are.equal(1, limiter._inflight)
+        assert.are.equal(2, limiter.anomalies.inflight_missing)
+        assert.are.equal(1, limiter.internal_errors)
     end)
+
+    it("surfaces a non-finite inflight counter as an internal error, never admits, never resets",
+        function()
+            for _, garbage in ipairs({ -math.huge, 0 / 0, math.huge }) do
+                local limiter, dict = fresh_env()
+                dict._data["al:1:payments:inflight"] = garbage
+                -- -inf + 1 == -inf would otherwise admit forever
+                local ok, err = limiter:try_acquire()
+                assert.falsy(ok, tostring(garbage))
+                assert.are.equal(errors.INTERNAL_ERROR, err)
+                assert.are.equal(1, limiter.anomalies.inflight_corrupted)
+                assert.are.equal(1, limiter.internal_errors)
+                assert.are.equal(0, limiter._inflight)
+                -- the key is left for the operator: no unsynchronized set
+                local v = dict._data["al:1:payments:inflight"]
+                assert.True(v ~= v or v == garbage)
+
+                local rok, rerr = limiter:release(0.01)
+                assert.falsy(rok)
+                assert.are.equal(errors.INTERNAL_ERROR, rerr)
+                assert.are.equal(2, limiter.anomalies.inflight_corrupted)
+            end
+        end)
+
+    it("surfaces a non-numeric inflight counter and follows failure_mode",
+        function()
+            local limiter, dict = fresh_env()
+            dict._data["al:1:payments:inflight"] = "garbage"
+            local ok, err = limiter:try_acquire()
+            assert.falsy(ok)
+            assert.are.equal(errors.INTERNAL_ERROR, err)
+            assert.are.equal(1, limiter.anomalies.inflight_corrupted)
+            assert.are.equal("garbage", dict._data["al:1:payments:inflight"])
+
+            -- lifecycle: fail_open admits without a slot, fail_closed sheds
+            ngx.ctx = {}
+            assert.True(limiter:access())
+            assert.are.equal(3, ngx.ctx["alim:payments"])
+            local closed = fresh_env({ failure_mode = "fail_closed" })
+            ngx.shared.adaptive_limit._data["al:1:payments:inflight"] = "garbage"
+            ngx.ctx = {}
+            local cok, cerr = closed:access()
+            assert.falsy(cok)
+            assert.are.equal(errors.INTERNAL_ERROR, cerr)
+        end)
 
     it("treats a limit above max_limit (or inf) as corrupted", function()
         local limiter, dict = fresh_env()

@@ -143,6 +143,8 @@ with a descriptive error — never silently accepted.
 | `overload_min_samples` | number | 20 | minimum completed outcomes before explicit-signal backoff may trigger |
 | `overload_failure_ratio` | number | 0.10 | strong-signal/completion ratio that triggers backoff |
 | `overload_backoff` | number | 0.80 | multiplicative backoff, `(0, 1)` |
+| `probe_interval` | integer | 30 | windows between baseline probes under saturation; `>= 3`, `0` disables |
+| `probe_fraction` | number | 0.5 | limit factor during the two probe windows, `(0, 1)` |
 | `latency_source` | string | `"request_time"` | `"request_time"` \| `"upstream_response_time"` \| `"manual"` |
 | `upstream_time_choice` | string | `"last"` | when retries produced several upstream timings: `"last"` \| `"max"` \| `"sum"` |
 | `rejection_status` | number | 503 | used only by `enforce()` |
@@ -177,6 +179,7 @@ incompatible shared state is a loud startup error.
 | `...:limit` | number (integer) | controller lease holder | permanent |
 | `...:inflight` | number | admission (incr), release (incr), exit_worker | permanent |
 | `...:long_rtt` / `...:short_rtt` / `...:gradient` | number | controller | permanent |
+| `...:probe_restore` | number | controller | present only during a baseline probe |
 | `...:last_window` | number | controller | permanent |
 | `...:last_update` | number | controller | permanent |
 | `...:w:<n>:c` / `:s` | number | worker flush (atomic incr) | exptime + explicit delete |
@@ -325,9 +328,28 @@ Given window measurement `m` and current state:
 2. If `m.sample_count < min_samples` and explicit backoff did not trigger →
    hold (no update at all).
 3. `short_rtt' = sample_alpha * m.mean_rtt + (1 - sample_alpha) * short_rtt`
-4. Freeze `long_rtt` whenever the strong-signal ratio exceeds the threshold;
-   otherwise update it from `short_rtt'`. Application errors such as HTTP 500
-   are not strong signals.
+4. Update `long_rtt` from `short_rtt'` only on app-limited windows (no
+   rejections) that are not overloaded; seed it from the first sufficient
+   non-overloaded window either way. Under saturation the limit shapes the
+   observed latency: a baseline learned there normalizes the queue, the
+   gradient reads 1.0, headroom grows the limit, and only failures stop the
+   ratchet (simulation I reproduces it: capacity 100, no timeouts,
+   limit 2000 and 3 s latency by window 180 with the old rule). Freeze it as
+   well whenever the strong-signal ratio exceeds the threshold. Application
+   errors such as HTTP 500 are not strong signals.
+   Under saturation the baseline is re-measured instead: when
+   `window % probe_interval == 0` and the window had rejections, the update
+   runs normally but is published at `limit' * probe_fraction` with the
+   real `limit'` kept in `probe_restore`. The next window (`% == 1`) is
+   polluted by requests admitted under the old limit (the publish lands
+   `aggregation_grace` into it) and holds; the one after ran entirely at
+   the probe limit, re-seeds `long_rtt` from its `mean_rtt` (up or down,
+   unless overloaded or below `min_samples`) and restores the limit.
+   Phases derive from the shared window number, so any worker can run any
+   phase. A window skipped during a probe simply restores on the next one
+   processed. (Same mechanism as Envoy adaptive concurrency's minRTT
+   recalculation and BBR's PROBE_RTT; both controllers share it via
+   `controller.common`.)
 5. `gradient = clamp(rtt_tolerance * long_rtt' / short_rtt', min_gradient, 1.0)`
 6. If the window contains a rejection, offered demand reached the cap:
    `headroom = clamp(sqrt(limit), headroom_min, headroom_max)`. Otherwise
@@ -351,8 +373,14 @@ latency sample. AIMD uses the same baseline, clamp, and safety rules.
 ### Publication
 
 The lease holder writes `limit`, `long_rtt`, `short_rtt`, `gradient`,
-`last_window`, `last_update` (6 `set` ops) and deletes the processed window
-keys. Controller work per limiter per window is ~10–20 shared-dict
+`probe_restore`, `last_window`, `last_update` (7 `set`/`delete` ops) and
+deletes the processed window keys. Before computing, it re-reads
+`last_window` under the lease and abandons the window if it is already
+`>= n` (`stale_controller_window` anomaly): a worker stalled past
+`lease_ttl` must not publish over a sibling's later windows (the lease
+orders leadership, not publication). The residual race — a stall between
+that re-read and the publish — is what a shared dict without compare-and-set
+cannot close; it needs a pause of seconds inside a non-yielding block. Controller work per limiter per window is ~10–20 shared-dict
 operations, executed by at most one worker, once per `sample_window`.
 
 ## 9. Failure model
@@ -388,7 +416,21 @@ operations, executed by at most one worker, once per `sample_window`.
   - no automatic reset ever runs (an unsynchronized "repair" while live
     requests modify the counter would corrupt it). The README documents the
     operator procedure: quiesce (or accept the shedding), then reset
-    `inflight` from an admin snippet. A lease/quota-based backend that
+    `inflight` from an admin snippet. An *evicted* `inflight` key (the
+    dictionary may drop unexpired entries under memory pressure) is the
+    one case rebuilt automatically, and never from zero: `incr` runs
+    without an init value, a `not found` is counted (`inflight_missing`),
+    the key is re-created with `add(this worker's held count)` — the
+    only value the worker can vouch for — and the discovering acquire
+    fails as an internal error. Sibling holdings admitted before the loss
+    surface as negative-inflight compensations as they drain, after which
+    the counter is exact again. The same rule covers a *corrupted*
+    `inflight` (foreign non-numeric or non-finite write): surfaced as
+    `inflight_corrupted` + `internal_error`, governed by `failure_mode`,
+    never re-seeded by the library. The `limit` key is different: a
+    corrupt limit is replaced by this worker's last observed value, which
+    erases nothing — every limit is a whole-instance value, not a sum of
+    per-worker contributions. A lease/quota-based backend that
     recovers automatically is a **separate, optional** backend and is not
     part of the default shared-counter path.
 
@@ -482,7 +524,7 @@ self-heal immediately as old workers finish draining.
 |---|---|
 | Algorithm math (hand-computed values, edge inputs) | busted `spec/*_spec.lua` |
 | Controller properties under generated inputs | busted fuzz specs (seeded PRNG) |
-| Scenarios A–H | deterministic simulations (`spec/simulation_spec.lua`) |
+| Scenarios A–I (I: sustained congestion without failures) | deterministic simulations (`spec/simulation_spec.lua`) |
 | Admission races, multi-worker caps | Test::Nginx `t/admission.t`, `t/multi_worker.t` (1/2/4 workers, 100 concurrent vs limit 10, thousands of reps) |
 | Lifecycle (§2 contract) | `t/lifecycle.t` |
 | Reload under traffic | `t/resilience.t`, `benchmark/resilience.sh` (HUP × N while wrk drives requests) |

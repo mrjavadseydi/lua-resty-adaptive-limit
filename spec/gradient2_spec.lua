@@ -34,6 +34,13 @@ local function near(a, b, eps)
     return math.abs(a - b) < (eps or 1e-6)
 end
 
+-- the controller's output as the next window's input (what the wiring does)
+local function state_of(next_state)
+    return { limit = next_state.limit, long_rtt = next_state.long_rtt,
+        short_rtt = next_state.short_rtt, gradient = next_state.gradient,
+        probe_restore = next_state.probe_restore }
+end
+
 describe("gradient2", function()
     it("grows by smoothing * headroom on a healthy window", function()
         local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
@@ -61,13 +68,74 @@ describe("gradient2", function()
     it("sheds when queueing exceeds rtt_tolerance", function()
         -- State already tracking a 3x RTT episode (short EWMA caught up).
         local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.060 }
-        -- short' = 0.060; long' = 0.05*0.060 + 0.95*0.020 = 0.022
-        -- gradient = clamp(2*0.022/0.060 = 0.7333.., 0.5, 1) = 0.7333..
-        -- candidate = 73.333.. + 10 = 83.333..; limit' = 50 + 41.666.. = 91.666..
+        -- short' = 0.060; long' = 0.020 (frozen: the window is saturated)
+        -- gradient = clamp(2*0.020/0.060 = 0.6666.., 0.5, 1) = 0.6666..
+        -- candidate = 66.666.. + 10 = 76.666..; limit' = 50 + 38.333.. = 88.333..
         local next_state = assert(common.safe_update(g2, state,
             healthy_window(1000, 0.060), base_cfg()))
-        assert.True(near(next_state.gradient, 0.7333333333333333))
-        assert.True(near(next_state.limit, 91.66666666666667))
+        assert.True(near(next_state.gradient, 0.6666666666666666))
+        assert.True(near(next_state.limit, 88.33333333333333))
+        assert.True(near(next_state.long_rtt, 0.020))
+    end)
+
+    it("learns the baseline only from app-limited windows", function()
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
+        local m = healthy_window(1000, 0.060)
+        m.rejected_count = 0
+        -- short' = 0.040; long' = 0.05*0.040 + 0.95*0.020 = 0.021
+        local next_state = assert(common.safe_update(g2, state, m, base_cfg()))
+        assert.True(near(next_state.long_rtt, 0.021))
+        -- the same window under saturation: the limit shapes the latency,
+        -- learning it would ratchet (simulation I)
+        m.rejected_count = 1
+        next_state = assert(common.safe_update(g2, state, m, base_cfg()))
+        assert.True(near(next_state.long_rtt, 0.020))
+    end)
+
+    it("probes the baseline under saturation every probe_interval windows", function()
+        local cfg = base_cfg()
+        cfg.probe_interval = 30
+        cfg.probe_fraction = 0.5
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.044 }
+        -- window 29: normal update, no probe
+        local m = healthy_window(1000, 0.044)
+        m.window = 29
+        local s1 = assert(common.safe_update(g2, state, m, cfg))
+        assert.is_nil(s1.probe_restore)
+        -- window 30: normal update (limit' = 50 + (100*0.9090.. + 10)*0.5
+        -- = 100.4545..), then published at half for the probe
+        m.window = 30
+        local s2 = assert(common.safe_update(g2, state, m, cfg))
+        assert.True(near(s2.probe_restore, 100.45454545454545))
+        assert.True(near(s2.limit, 50.22727272727273))
+        -- window 31 is polluted by pre-probe admissions: held at the
+        -- probe limit, nothing learned
+        m.window = 31
+        m.mean_rtt = 0.030
+        local s3 = assert(common.safe_update(g2, state_of(s2), m, cfg))
+        assert.True(s3.held)
+        assert.True(near(s3.limit, 50.22727272727273))
+        assert.True(near(s3.long_rtt, 0.020))
+        assert.True(near(s3.short_rtt, 0.044))
+        -- window 32 ran entirely at the probe limit: it re-seeds the
+        -- baseline (up or down) and restores the limit
+        m.window = 32
+        m.mean_rtt = 0.025
+        local s4 = assert(common.safe_update(g2, state_of(s3), m, cfg))
+        assert.is_nil(s4.probe_restore)
+        assert.True(near(s4.limit, 100.45454545454545))
+        assert.True(near(s4.long_rtt, 0.025))
+        -- app-limited windows never probe: the baseline learns directly
+        m.window = 60
+        m.rejected_count = 0
+        assert.is_nil(common.safe_update(g2, state, m, cfg).probe_restore)
+        m.rejected_count = 1
+        -- an overloaded probe window learns nothing but still restores
+        m.window = 32
+        m.overload_count = 500
+        local s5 = assert(common.safe_update(g2, state_of(s3), m, cfg))
+        assert.is_nil(s5.probe_restore)
+        assert.True(near(s5.long_rtt, 0.020))
     end)
 
     it("backs off faster on explicit overload windows and freezes the baseline", function()
@@ -192,6 +260,7 @@ describe("gradient2", function()
         local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
         local m = healthy_window(100, 0.030)
         m.aborted_count = 50 -- client aborts are not strong signals
+        m.rejected_count = 0
         -- baseline updates normally: long' = 0.020 + 0.05*(0.025-0.020)
         --                          = 0.02025
         local next_state = assert(common.safe_update(g2, state, m, base_cfg()))

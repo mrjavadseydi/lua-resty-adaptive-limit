@@ -105,30 +105,45 @@ local function internal_error(self, where, err)
     return nil, errors.INTERNAL_ERROR
 end
 
--- A non-numeric inflight counter (foreign write into the zone) would turn
--- every incr into an internal error — permanent fail-open. Snap it to 0
--- and surface, like the limit key.
-local function repair_inflight(self, dict, err)
-    if err ~= "not a number" then
-        return false
-    end
+-- A corrupted inflight counter — non-numeric (incr fails with "not a
+-- number") or numeric garbage (NaN, +-inf: -inf + 1 == -inf would admit
+-- forever) — is a foreign write into the zone. Unlike the limit key it is
+-- NOT re-seeded here: the library cannot know how many slots sibling
+-- workers hold, and an unsynchronized set() while live requests move
+-- the counter would erase their admissions (design.md §9 — the same
+-- reason SIGKILL leaks are never auto-repaired). It is surfaced as an
+-- internal error, governed by failure_mode, until an operator resets
+-- the key (README: Failure behavior).
+local function inflight_corrupted(self, where, detail)
     count_anomaly(self, "inflight_corrupted")
-    dict:set(self.K_inflight, 0)
     rate_limited_log(self, "inflight_corrupted", ngx_ERR,
-        "inflight key corrupted (non-numeric); re-seeded to 0")
-    return true
+        "inflight counter corrupted (", detail, "); not repaired — ",
+        "reset the key once traffic is quiesced")
+    return internal_error(self, where, "inflight corrupted")
 end
 
--- incr succeeded but the counter is numeric garbage (NaN, +-inf, or a
--- negative value we did not just create): arithmetic on it stays garbage
--- (-inf + 1 == -inf would admit forever), so snap it to `value` — what
--- this worker knows it holds right now — and surface.
-local function snap_inflight(self, dict, value)
-    count_anomaly(self, "inflight_corrupted")
-    dict:set(self.K_inflight, value)
-    rate_limited_log(self, "inflight_corrupted", ngx_ERR,
-        "inflight counter non-finite or negative; re-seeded to ",
-        tostring(value))
+local function non_finite(n)
+    return n ~= n or n == math.huge or n == -math.huge
+end
+
+-- The inflight counter is gone (an unexpired key evicted under memory
+-- pressure — ngx.shared permits that — or a flushed dict) while requests
+-- still hold slots. Recreating it from zero would forget every held
+-- slot and break the cap; the value this worker can vouch for is its
+-- own mirror, so the counter is rebuilt from that lower bound (add: the
+-- first worker to notice wins, siblings then incr on top). Sibling
+-- holdings admitted before the loss are missing until they drain: each
+-- such release drives the counter below zero and is compensated there
+-- (negative_inflight), so the counter is exact again once the
+-- pre-eviction requests have completed. An acquire that discovers the
+-- loss fails as an internal error so it is visible and failure_mode
+-- decides that request; a release completes against the rebuilt counter.
+local function rebuild_inflight(self)
+    count_anomaly(self, "inflight_missing")
+    self.st.dict:add(self.K_inflight, self._inflight)
+    rate_limited_log(self, "inflight_missing", ngx_ERR,
+        "inflight counter missing (evicted?); rebuilt from this worker's ",
+        tostring(self._inflight), " held slots")
 end
 
 function _M.new(user_cfg)
@@ -352,21 +367,27 @@ function _M:try_acquire()
     end
     self._last_limit = limit
 
-    -- Admission linearization point (see top-of-file comment).
-    local n, ierr = dict:incr(self.K_inflight, 1, 0)
-    if not n and repair_inflight(self, dict, ierr) then
-        n, ierr = dict:incr(self.K_inflight, 1, 0)
-    end
+    -- Admission linearization point (see top-of-file comment). No init
+    -- value: a missing counter is lost admission state, never zero.
+    local n, ierr = dict:incr(self.K_inflight, 1)
     if not n then
+        if ierr == "not a number" then
+            return inflight_corrupted(self, "incr(inflight)", "non-numeric")
+        elseif ierr == "not found" then
+            rebuild_inflight(self)
+            return internal_error(self, "incr(inflight)", "inflight missing")
+        end
         return internal_error(self, "incr(inflight)", ierr)
     end
-    -- We added 1 to a counter that is never legitimately below 0, so
-    -- anything but a finite n >= 1 is a foreign write; the one slot we
-    -- know about is our own.
-    if n ~= n or n < 1 or n == math.huge then
-        snap_inflight(self, dict, 1)
-        n = 1
+    if non_finite(n) then
+        -- our increment is meaningless on garbage; no slot is held
+        return inflight_corrupted(self, "incr(inflight)", "non-finite")
     end
+    -- A finite result below 1 means the counter was negative before our
+    -- increment: a double release being compensated on another worker.
+    -- Admitting on it is at most one slot optimistic and self-corrects
+    -- through that compensation; garbage negatives are unreachable
+    -- because every write is an incr from a validated value.
 
     if n <= limit then
         self._inflight = self._inflight + 1
@@ -416,18 +437,24 @@ function _M:release(latency, outcome)
 
     -- 1. Release the slot. This must succeed for accounting to hold.
     local n, err = dict:incr(self.K_inflight, -1)
-    if not n and repair_inflight(self, dict, err) then
-        -- the counter was garbage: the slot no longer exists to release
-        n = 0
+    if not n and err == "not found" then
+        -- evicted while this slot was held: rebuild (our mirror still
+        -- counts the slot) and release against the rebuilt counter
+        rebuild_inflight(self)
+        n, err = dict:incr(self.K_inflight, -1)
     end
     if not n then
         -- The slot leaks; surfaced via internal_errors and the stuck
         -- diagnostics. The caller may retry the release once.
+        if err == "not a number" then
+            return inflight_corrupted(self, "incr(inflight, -1)", "non-numeric")
+        end
         return internal_error(self, "incr(inflight, -1)", err)
     end
-    if n ~= n or n == math.huge or n == -math.huge then
-        snap_inflight(self, dict, 0)
-    elseif n < 0 then
+    if non_finite(n) then
+        return inflight_corrupted(self, "incr(inflight, -1)", "non-finite")
+    end
+    if n < 0 then
         -- Double release (or a lost admission): undo our own excess
         -- decrement with an atomic incr rather than set(0) — another
         -- worker may have admitted between the two operations, and a
@@ -838,6 +865,18 @@ function _M:control_window(n, now)
             "controller state read failed: ", err or "unknown")
         return false
     end
+    -- The lease alone does not order publications: a worker paused
+    -- between control() and here (timer stall, SIGSTOP) outlives its
+    -- LEASE_TTL, a sibling re-leases and publishes this window and
+    -- later ones, and our publish would then move limit and last_window
+    -- backwards. The re-read above is the authority: superseded means
+    -- abandon. (A pause between this read and the publish below is the
+    -- residual window a shared dict without compare-and-set leaves open.)
+    if (tonumber(cs.last_window) or 0) >= n then
+        count_anomaly(self, "stale_controller_window")
+        self.controller_skips = (self.controller_skips or 0) + 1
+        return false
+    end
 
     local measurement = {
         sample_count = acc.c,
@@ -849,12 +888,14 @@ function _M:control_window(n, now)
         aborted_count = acc.abt,
         rejected_count = acc.rej,
         completions = acc.cmp,
+        window = n,
     }
 
     local state = {
         limit = cs.limit_f or cs.limit or cfg.initial_limit,
         long_rtt = cs.long_rtt,
         short_rtt = cs.short_rtt,
+        probe_restore = cs.probe_restore,
     }
 
     local next_state, uerr = common_ctrl.safe_update(self.algorithm,
@@ -884,6 +925,7 @@ function _M:control_window(n, now)
             limit = repaired_state.limit,
             long_rtt = repaired_state.long_rtt,
             short_rtt = repaired_state.short_rtt,
+            probe_restore = repaired_state.probe_restore,
             gradient = nil,
         }
     elseif next_state.held then
@@ -892,7 +934,8 @@ function _M:control_window(n, now)
     end
 
     local pok, perr = st:publish_controller_state(next_state.limit,
-        next_state.long_rtt, next_state.short_rtt, next_state.gradient, n, now)
+        next_state.long_rtt, next_state.short_rtt, next_state.gradient,
+        next_state.probe_restore, n, now)
     if not pok then
         -- Partial publication (no memory, ...): last_window is written
         -- last, so it did not advance and the window's accumulators are
@@ -945,14 +988,14 @@ function _M:exit_worker()
         return true
     end
     local dict = self.st.dict
-    local n = dict:incr(self.K_inflight, -held)
+    local n, err = dict:incr(self.K_inflight, -held)
     if not n then
-        self.internal_errors = self.internal_errors + 1
-        return nil, errors.INTERNAL_ERROR
+        return internal_error(self, "exit incr(inflight)", err)
     end
-    if n ~= n or n == math.huge or n == -math.huge then
-        snap_inflight(self, dict, 0)
-    elseif n < 0 then
+    if non_finite(n) then
+        return inflight_corrupted(self, "exit incr(inflight)", "non-finite")
+    end
+    if n < 0 then
         dict:incr(self.K_inflight, -n) -- see release(): atomic, not set(0)
     end
     self._inflight = 0
@@ -1045,6 +1088,7 @@ function _M:state()
         short_rtt = getnum(K.short_rtt),
         long_rtt = getnum(K.long_rtt),
         gradient = getnum(K.gradient),
+        probe_restore = getnum(K.probe_restore),
 
         window = floor(now / cfg.sample_window),
         last_window = getnum(K.last_window),
