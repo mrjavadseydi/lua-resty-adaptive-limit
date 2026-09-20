@@ -192,6 +192,8 @@ describe("control_window measurement validation", function()
         assert.falsy(limiter:control_window(100, 1015))
         dict.set = set
         assert.are.equal(1, limiter.internal_errors)
+        -- a failed publication is not an update
+        assert.are.equal(0, limiter.controller_updates or 0)
         -- last_window did not advance and the accumulators survived
         assert.are.equal(0, dict:get("al:1:pay:last_window"))
         assert.are.equal(25, dict:get(win_key(100, "c")))

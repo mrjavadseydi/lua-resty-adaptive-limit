@@ -119,6 +119,18 @@ local function repair_inflight(self, dict, err)
     return true
 end
 
+-- incr succeeded but the counter is numeric garbage (NaN, +-inf, or a
+-- negative value we did not just create): arithmetic on it stays garbage
+-- (-inf + 1 == -inf would admit forever), so snap it to `value` — what
+-- this worker knows it holds right now — and surface.
+local function snap_inflight(self, dict, value)
+    count_anomaly(self, "inflight_corrupted")
+    dict:set(self.K_inflight, value)
+    rate_limited_log(self, "inflight_corrupted", ngx_ERR,
+        "inflight counter non-finite or negative; re-seeded to ",
+        tostring(value))
+end
+
 function _M.new(user_cfg)
     local cfg, err = config_mod.build(user_cfg)
     if not cfg then
@@ -348,6 +360,13 @@ function _M:try_acquire()
     if not n then
         return internal_error(self, "incr(inflight)", ierr)
     end
+    -- We added 1 to a counter that is never legitimately below 0, so
+    -- anything but a finite n >= 1 is a foreign write; the one slot we
+    -- know about is our own.
+    if n ~= n or n < 1 or n == math.huge then
+        snap_inflight(self, dict, 1)
+        n = 1
+    end
 
     if n <= limit then
         self._inflight = self._inflight + 1
@@ -406,7 +425,9 @@ function _M:release(latency, outcome)
         -- diagnostics. The caller may retry the release once.
         return internal_error(self, "incr(inflight, -1)", err)
     end
-    if n < 0 then
+    if n ~= n or n == math.huge or n == -math.huge then
+        snap_inflight(self, dict, 0)
+    elseif n < 0 then
         -- Double release (or a lost admission): undo our own excess
         -- decrement with an atomic incr rather than set(0) — another
         -- worker may have admitted between the two operations, and a
@@ -714,8 +735,8 @@ function _M:tick(now, worker_id)
     -- (an idle worker next to saturated siblings would otherwise report
     -- a false stall). Monotonic max; once per tick, never per request.
     local lc = self.stats.last_completion
-    if lc and lc ~= self._lc_published then
-        self.st:publish_last_completion(lc)
+    if worker_id ~= nil and lc and lc ~= self._lc_published
+        and self.st:publish_last_completion(worker_id, lc) then
         self._lc_published = lc
     end
     self:control(now)
@@ -868,8 +889,6 @@ function _M:control_window(n, now)
     elseif next_state.held then
         held = true
         self.controller_skips = (self.controller_skips or 0) + 1
-    else
-        self.controller_updates = (self.controller_updates or 0) + 1
     end
 
     local pok, perr = st:publish_controller_state(next_state.limit,
@@ -882,6 +901,9 @@ function _M:control_window(n, now)
         rate_limited_log(self, "publish", ngx_ERR,
             "controller state publish failed: ", perr or "unknown")
         return false
+    end
+    if not held then
+        self.controller_updates = (self.controller_updates or 0) + 1
     end
     self._last_limit = math.floor(next_state.limit)
     st:delete_window(n)
@@ -912,8 +934,8 @@ end
 -- Call via adaptive.exit() from exit_worker_by_lua*. During graceful
 -- shutdown the requests held here are torn down and will never reach
 -- log_by_lua, so their slots would leak forever without this. If a
--- straggler log phase still fires afterwards, its release floors the
--- shared counter at 0 and raises the negative-inflight anomaly —
+-- straggler log phase still fires afterwards, its excess decrement is
+-- compensated and raises the negative-inflight anomaly —
 -- visible, never corrupting. Abrupt death (SIGKILL) runs nothing at
 -- all: that leak is a documented limitation, surfaced through heartbeat
 -- expiry and the stuck diagnostics in state().
@@ -928,7 +950,9 @@ function _M:exit_worker()
         self.internal_errors = self.internal_errors + 1
         return nil, errors.INTERNAL_ERROR
     end
-    if n < 0 then
+    if n ~= n or n == math.huge or n == -math.huge then
+        snap_inflight(self, dict, 0)
+    elseif n < 0 then
         dict:incr(self.K_inflight, -n) -- see release(): atomic, not set(0)
     end
     self._inflight = 0
@@ -969,13 +993,20 @@ function _M:state()
 
     local limit = getnum(K.limit)
     local inflight = getnum(K.inflight)
-    -- newest completion across the instance: the shared value is
-    -- published once per tick (see tick()), this worker's own may be a
-    -- tick fresher
-    local last_completion = getnum(K.last_completion)
-    if s.last_completion
-        and (last_completion == nil or s.last_completion > last_completion) then
-        last_completion = s.last_completion
+    -- worker liveness: heartbeat slots are indexed by worker id; the
+    -- per-worker completion times live next to them (published once per
+    -- tick, see tick()) and this worker's own may be a tick fresher
+    local expected = ngx.worker.count() or 1
+    local active = 0
+    local last_completion = s.last_completion
+    for i = 0, expected - 1 do
+        if st:worker_alive(i) then
+            active = active + 1
+        end
+        local lc = st:worker_last_completion(i)
+        if lc and (last_completion == nil or lc > last_completion) then
+            last_completion = lc
+        end
     end
     local since_completion = last_completion and (now - last_completion)
 
@@ -987,15 +1018,6 @@ function _M:state()
         and inflight >= limit
         and (since_completion == nil
              or since_completion > cfg.stale_threshold)
-
-    -- worker liveness: heartbeat slots are indexed by worker id
-    local expected = ngx.worker.count() or 1
-    local active = 0
-    for i = 0, expected - 1 do
-        if st:worker_alive(i) then
-            active = active + 1
-        end
-    end
 
     -- last closed window's raw accumulators (shared view)
     local win = floor(now / cfg.sample_window) - 1

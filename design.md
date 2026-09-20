@@ -183,6 +183,7 @@ incompatible shared state is a loud startup error.
 | `...:w:<n>:ovl` / `:tmo` / `:cer` / `:err` / `:abt` / `:rej` / `:cmp` | number | worker flush (atomic incr) | exptime + explicit delete |
 | `...:lease:<n>` | string `"<pid>:<seq>"` | lease contender (add) | TTL (`lease_ttl`) |
 | `...:hb:<worker_id>` | number (timestamp) | scheduler heartbeat | TTL 5s |
+| `...:lc:<worker_id>` | number (timestamp) | scheduler tick (newest completion) | permanent |
 
 Invariants of the shared model:
 
@@ -225,9 +226,12 @@ return nil, REJECTED
   simultaneously (proven by `t/admission.t` under 1/2/4 workers with
   thousands of repetitions).
 - A rejected request can never permanently raise `inflight`: the rollback
-  decrement is unconditional; if the decrement ever returns a negative
-  value the counter is snapped to 0 and a counter anomaly is counted (this
-  surfaces lost admissions rather than hiding them).
+  decrement is unconditional; if a decrement ever returns a negative
+  value the excess is compensated with an atomic increment (never a
+  `set`, which would erase a sibling's concurrent admission) and a
+  counter anomaly is counted (this surfaces lost admissions rather than
+  hiding them). A non-finite counter (`-inf + 1 == -inf`) is snapped to
+  the slots this worker knows it holds.
 
 ### Semantics while the limit changes
 

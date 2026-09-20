@@ -153,3 +153,33 @@ describe("strong-signal classification (controllers)", function()
         assert.are.equal(105.0, next_state.limit)
     end)
 end)
+
+describe("controller_stalled across workers", function()
+    it("uses the newest completion of any worker, not just this one", function()
+        runtime.started = false
+        runtime.registry = {}
+        runtime.order = {}
+        ngx.reset()
+        ngx.shared.adaptive_limit = ngx.make_dict()
+        ngx._worker_count = 2
+        ngx._worker_id = 0
+        local limiter = assert(adaptive.new({ name = "pay",
+            shared_dict = "adaptive_limit", initial_limit = 1, max_limit = 1,
+            stale_threshold = 30 }))
+        assert(adaptive.start())
+        ngx._now = 1000
+        assert.True(limiter:try_acquire()) -- pool exhausted
+
+        -- this worker never saw a completion, but worker 1 did recently
+        assert.True(limiter:state().controller_stalled)
+        limiter.st:publish_last_completion(1, 990)
+        assert.False(limiter:state().controller_stalled)
+
+        -- ticks publish this worker's own completion under its id
+        assert.True(limiter:release(0.01))
+        limiter:tick(1000, 0)
+        assert.are.equal(1000, limiter.st:worker_last_completion(0))
+        assert.are.equal(990, limiter.st:worker_last_completion(1))
+        ngx._worker_count = nil
+    end)
+end)

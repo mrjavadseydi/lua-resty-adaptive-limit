@@ -7,7 +7,7 @@
 -- Key layout (prefix = "al:<schema>:<name>:"):
 --   limit, inflight, long_rtt, short_rtt, gradient,
 --   last_window, last_update   — permanent controller state
---   last_completion            — newest completion time across workers
+--   lc:<worker_id>             — that worker's newest completion time
 --   w:<n>:c|s|ovl|tmo|err|abt|rej|cmp — per-window aggregate accumulators;
 --       every writer uses atomic incr (init 0), so flushes from any
 --       number of workers are race-free by construction. Keys carry an
@@ -52,8 +52,6 @@ function _M.new(dict, name)
         gradient    = prefix .. "gradient",
         last_window = prefix .. "last_window",
         last_update = prefix .. "last_update",
-        -- newest completion time seen by any worker (stuck diagnostics)
-        last_completion = prefix .. "last_completion",
     }
 
     local state = {
@@ -214,14 +212,16 @@ function _M:publish_controller_state(limit_f, long_rtt, short_rtt, gradient,
     return true
 end
 
--- Monotonic max of the newest completion time; control path, once per
--- tick per worker. The get/set pair races benignly (two workers can
--- only publish values within one tick of each other).
-function _M:publish_last_completion(t)
-    local cur = self.dict:get(self.K.last_completion)
-    if type(cur) ~= "number" or t > cur then
-        self.dict:set(self.K.last_completion, t)
-    end
+-- Per-worker newest completion time (no TTL: a dead worker's last
+-- completion is still a completion). One key per worker, so no
+-- cross-worker read-modify-write exists; state() takes the max.
+function _M:publish_last_completion(worker_id, t)
+    return self.dict:set(self.prefix .. "lc:" .. worker_id, t)
+end
+
+function _M:worker_last_completion(worker_id)
+    local v = self.dict:get(self.prefix .. "lc:" .. worker_id)
+    return type(v) == "number" and v or nil
 end
 
 return _M

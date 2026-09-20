@@ -160,6 +160,26 @@ describe("admission", function()
         assert.are.equal(1, limiter.anomalies.negative_inflight)
     end)
 
+    it("treats a non-finite or negative inflight counter as corrupted", function()
+        for _, garbage in ipairs({ -math.huge, 0 / 0, -1e9, math.huge }) do
+            local limiter, dict = fresh_env()
+            dict._data["al:1:payments:inflight"] = garbage
+            -- -inf + 1 == -inf would otherwise admit forever
+            for _ = 1, 10 do
+                assert.True(limiter:try_acquire())
+            end
+            local ok, err = limiter:try_acquire()
+            assert.falsy(ok, tostring(garbage))
+            assert.are.equal(errors.REJECTED, err)
+            assert.are.equal(1, limiter.anomalies.inflight_corrupted)
+            assert.are.equal(10, dict._data["al:1:payments:inflight"])
+            -- release on a counter that went non-finite again snaps to 0
+            dict._data["al:1:payments:inflight"] = 0 / 0
+            assert.True(limiter:release(0.01))
+            assert.are.equal(0, dict._data["al:1:payments:inflight"])
+        end
+    end)
+
     it("treats a limit above max_limit (or inf) as corrupted", function()
         local limiter, dict = fresh_env()
         dict._data["al:1:payments:limit"] = math.huge

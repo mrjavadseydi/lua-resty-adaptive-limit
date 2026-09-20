@@ -172,8 +172,10 @@ capacity signal); `ignored` contributes nothing at all (health checks).
 An unknown outcome string (a typo) still releases the slot; the
 observation is dropped with a `bad_outcome` anomaly and a rate-limited
 error log, so a typo in one code path can never leak concurrency.
-A negative counter result — double release — is snapped to zero and
-counted as an anomaly; it is surfaced, never hidden.
+A negative counter result — double release — is compensated with an
+atomic increment (never a `set`, which would erase a sibling worker's
+concurrent admission) and counted as an anomaly; it is surfaced, never
+hidden.
 
 ### `limiter:access(options) -> true | nil, err`
 
@@ -258,8 +260,8 @@ and starts the single scheduler timer. `options.flush_interval` (default
 
 *Where:* `exit_worker_by_lua`. Subtracts the slots this worker still holds
 from the shared counter: graceful shutdown and reload drains cannot leak
-them. If a straggler log phase still fires afterwards, its release floors
-the counter at zero and raises an anomaly — visible, never corrupting.
+them. If a straggler log phase still fires afterwards, its excess
+decrement is compensated and raises an anomaly — visible, never corrupting.
 
 ### `adaptive.get(name) -> limiter`
 
@@ -329,15 +331,16 @@ raises `limit_missing` anomalies rather than admitting unbounded.
   corruption): re-seeded from the worker's last observed limit — fresh to
   within one window — with a `limit_missing`/`limit_corrupted` anomaly;
   a limit outside `[min_limit, max_limit]` (including `inf`) is treated
-  the same way; a non-numeric `inflight` counter is snapped to 0
-  (`inflight_corrupted`).
+  the same way; a non-numeric, non-finite or negative `inflight` counter
+  is snapped to what this worker knows it holds (`inflight_corrupted`) —
+  `-inf + 1` must never admit.
   The limiter never crashes a request comparing against garbage.
 * **Graceful reload (`nginx -s reload`)**: the shared dictionary
   survives; new workers validate the schema marker and adopt the learned
   limit. Verified under continuous wrk load across repeated reloads
   (`benchmark/resilience.sh`): no lockout, no reset, no drift.
 * **Worker exit (graceful)**: `adaptive.exit()` reconciles held slots.
-  Late log phases are safe (counter floors at zero, anomaly counted).
+  Late log phases are safe (the excess decrement is compensated, anomaly counted).
 * **Worker death (SIGKILL/segfault)**: nothing runs. The victim's held
   slots leak — the shared counter stays high, reducing capacity until an
   operator acts. An unsynchronized "repair" while live requests
