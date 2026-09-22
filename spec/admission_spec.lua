@@ -139,6 +139,38 @@ describe("admission", function()
         assert.are.equal(1, limiter.anomalies.negative_inflight)
     end)
 
+    it("does not repair another worker's negative hole", function()
+        local limiter, dict = fresh_env()
+        -- four unrepaired excess releases already sit in the counter
+        dict._data["al:1:payments:inflight"] = -4
+        assert.True(limiter:release(0.010))
+        -- this call subtracted 1 and adds 1 back; the pre-existing hole stays
+        assert.are.equal(-4, dict._data["al:1:payments:inflight"])
+        assert.are.equal(1, limiter.anomalies.negative_inflight)
+    end)
+
+    it("repairs a negative rollback by one, not by the whole hole", function()
+        local limiter, dict = fresh_env({ initial_limit = 1, max_limit = 1,
+            min_limit = 1 })
+        assert.True(limiter:try_acquire())
+        local incr = dict.incr
+        dict.incr = function(d, key, delta, init, ttl)
+            local n, err = incr(d, key, delta, init, ttl)
+            if key == "al:1:payments:inflight" and delta == 1 and n == 2 then
+                -- concurrent releases drain the counter before rollback
+                incr(d, key, -3)
+            end
+            return n, err
+        end
+        local ok, err = limiter:try_acquire()
+        dict.incr = incr
+        assert.falsy(ok)
+        assert.are.equal(errors.REJECTED, err)
+        -- rollback observed -2 and added back its own 1, leaving -1
+        assert.are.equal(-1, dict._data["al:1:payments:inflight"])
+        assert.are.equal(1, limiter.anomalies.negative_inflight)
+    end)
+
     it("negative-inflight repair keeps a sibling's concurrent admission", function()
         local limiter, dict = fresh_env()
         -- inflight is 0; a double release drives it to -1, and another

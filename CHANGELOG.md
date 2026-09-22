@@ -7,6 +7,25 @@ All notable changes are documented here. Format based on
 ## [Unreleased]
 
 ### Fixed
+- Controller: a window of zero RTTs (sub-millisecond completions recorded
+  as 0) no longer seeds the baseline. The next real sample was flooring
+  the gradient and, with rejections freezing that zero, pinning the limit
+  at `min_limit` until the next probe.
+- Admission: a negative inflight repair adds back only the excess this
+  decrement introduced. Repairing the whole hole across workers left
+  phantom slots and could shed all traffic after a reload.
+- Controller: a baseline probe no longer re-seeds `long_rtt` from a window
+  that still contains completions admitted before the probe limit was
+  published. The reduced limit is held until one RTT has drained, then
+  restored without learning if the sample is still queued.
+- `start()` refuses a shared dict with no `expire()` (lua-resty-core is
+  required and is now loaded by the library). A missing `expire` used to
+  throw inside the scheduler, skip every controller update, and add the
+  same window deltas again on the next tick.
+- `controller_stalled` waits out `stale_threshold` after the pool fills
+  instead of firing on the first full look with no completion yet.
+- `log()` releases the concurrency slot before the outcome classifier.
+
 - Controller: the latency baseline no longer learns from saturated windows,
   which normalized sustained congestion and ratcheted the limit to
   `max_limit` when the backend queued without failing (simulation I).

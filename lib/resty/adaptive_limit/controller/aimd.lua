@@ -10,7 +10,6 @@
 -- ).
 
 local clamp = require("resty.adaptive_limit.util.clamp")
-local ewma = require("resty.adaptive_limit.util.ewma")
 local common = require("resty.adaptive_limit.controller.common")
 
 local _M = {
@@ -37,35 +36,27 @@ function _M.update(state, m, cfg)
     if sc < cfg.min_samples and not strong_overload then
         return {
             limit = limit,
-            long_rtt = state.long_rtt,
-            short_rtt = state.short_rtt,
+            long_rtt = common.usable_rtt(state.long_rtt) and state.long_rtt
+                or nil,
+            short_rtt = common.usable_rtt(state.short_rtt) and state.short_rtt
+                or nil,
             gradient = state.gradient,
             held = true,
         }
     end
 
-    local short_rtt = state.short_rtt
-    if sc >= cfg.min_samples and short_rtt == nil then
-        short_rtt = m.mean_rtt
-    elseif sc >= cfg.min_samples then
-        short_rtt = ewma(short_rtt, m.mean_rtt, cfg.sample_alpha)
-    end
-
     -- baseline frozen on congested and on saturated windows, the first
     -- one included (see gradient2.lua): never learn an overloaded RTT
-    -- as healthy, never normalize a queue the limit itself caused
-    local long_rtt = state.long_rtt
-    if sc >= cfg.min_samples and not overloaded
-        and (m.rejected_count == 0 or long_rtt == nil) then
-        long_rtt = ewma(long_rtt, short_rtt, cfg.baseline_alpha)
-    end
+    -- as healthy, never normalize a queue the limit itself caused.
+    -- A non-positive mean does not seed or move RTT state.
+    local short_rtt, long_rtt = common.observe_rtt(state, m, cfg, overloaded)
 
     -- Latency congestion: the smoothed RTT exceeded rtt_tolerance times
     -- the baseline (the same shedding trigger Gradient2 uses, as a
     -- boolean instead of a gradient).
     local congested = strong_overload
     if not congested and sc >= cfg.min_samples
-        and long_rtt ~= nil and long_rtt > 0
+        and common.usable_rtt(long_rtt) and common.usable_rtt(short_rtt)
         and short_rtt > cfg.rtt_tolerance * long_rtt then
         congested = true
     end

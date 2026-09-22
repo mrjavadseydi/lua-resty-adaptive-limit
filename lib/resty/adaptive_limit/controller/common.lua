@@ -8,13 +8,51 @@
 -- state: the wiring holds the previous limit and counts an internal
 -- error instead (invariant 9).
 
+local ewma = require("resty.adaptive_limit.util.ewma")
+
 local _M = {}
 
 local math_huge = math.huge
+local math_ceil = math.ceil
+
+-- How many windows a probe may stay reduced while waiting for pre-probe
+-- admissions to drain. Past this, restore the limit and keep the old
+-- baseline rather than learn a still-queued RTT.
+local PROBE_OFFSET_CAP = 4
 
 function _M.is_finite(v)
     -- NaN fails the first check (NaN ~= NaN); +-inf fail the others.
     return v == v and v < math_huge and v > -math_huge
+end
+
+-- A latency the controller may learn from. Zero is not a baseline:
+-- ngx.now() has millisecond resolution, so a window of sub-millisecond
+-- completions records mean_rtt = 0, and the next real sample then floors
+-- the gradient. Non-positive stored state is treated as "not seeded".
+function _M.usable_rtt(v)
+    return type(v) == "number" and _M.is_finite(v) and v > 0
+end
+
+-- Update short/long RTT from one window. A non-positive mean updates
+-- nothing. long_rtt still seeds from the first usable window even when
+-- that window rejected: demand above the limit with a healthy backend
+-- is how a cold limiter learns, and refusing it leaves the gradient at
+-- 1 until the next probe.
+function _M.observe_rtt(state, m, cfg, overloaded)
+    local short_rtt = _M.usable_rtt(state.short_rtt) and state.short_rtt or nil
+    local long_rtt = _M.usable_rtt(state.long_rtt) and state.long_rtt or nil
+    if m.sample_count < cfg.min_samples or not _M.usable_rtt(m.mean_rtt) then
+        return short_rtt, long_rtt
+    end
+    if short_rtt == nil then
+        short_rtt = m.mean_rtt
+    else
+        short_rtt = ewma(short_rtt, m.mean_rtt, cfg.sample_alpha)
+    end
+    if not overloaded and (m.rejected_count == 0 or long_rtt == nil) then
+        long_rtt = ewma(long_rtt, short_rtt, cfg.baseline_alpha)
+    end
+    return short_rtt, long_rtt
 end
 
 local function is_count(v)
@@ -136,34 +174,84 @@ end
 -- when this window belongs to a probe (the caller returns it as-is), or
 -- nil when the normal update runs. probe_start(next_state, m, cfg)
 -- turns a normal update into the start of a probe when one is due.
+-- The window the reduced limit is published into is polluted. Later
+-- windows reseed only once sample_window has had time to drain one RTT
+-- of pre-probe admissions; otherwise the probe limit is held (up to
+-- PROBE_OFFSET_CAP) and then restored without learning the queued RTT.
+local function hold_probe(state, restore)
+    return {
+        limit = state.limit,
+        long_rtt = _M.usable_rtt(state.long_rtt) and state.long_rtt or nil,
+        short_rtt = _M.usable_rtt(state.short_rtt) and state.short_rtt or nil,
+        gradient = state.gradient,
+        probe_restore = restore,
+        held = true,
+    }
+end
+
+local function restore_probe(state, restore, long_rtt)
+    return {
+        limit = restore,
+        long_rtt = long_rtt,
+        short_rtt = _M.usable_rtt(state.short_rtt) and state.short_rtt or nil,
+        gradient = state.gradient,
+        held = false,
+    }
+end
+
+-- True when completions in this probe window were admitted under the
+-- reduced limit. A completion was admitted about one RTT earlier, so
+-- window offset k (1 = the window the probe was published into) is
+-- clean only once k >= ceil(rtt / sample_window) + 1. Callers that do
+-- not pass sample_window keep the historical "offset >= 2" rule.
+local function probe_drained(mean, sample_window, offset)
+    if type(sample_window) ~= "number" or not (sample_window > 0) then
+        return offset >= 2
+    end
+    if not _M.usable_rtt(mean) then
+        return false
+    end
+    local need = math_ceil(mean / sample_window) + 1
+    if need < 2 then
+        need = 2
+    end
+    return offset >= need
+end
+
 function _M.probe_step(state, m, cfg, overloaded)
     local restore = state.probe_restore
     local interval = cfg.probe_interval or 0
     if restore == nil or interval <= 0 or m.window == nil then
         return nil
     end
-    if m.window % interval == 1 then
-        -- polluted window: hold the probe limit, learn nothing
-        return {
-            limit = state.limit,
-            long_rtt = state.long_rtt,
-            short_rtt = state.short_rtt,
-            gradient = state.gradient,
-            probe_restore = restore,
-            held = true,
-        }
+    local offset = m.window % interval
+    -- The publish lands in the next window; that window is polluted by
+    -- admissions taken at the old limit.
+    if offset == 1 then
+        return hold_probe(state, restore)
     end
-    local long_rtt = state.long_rtt
-    if m.sample_count >= cfg.min_samples and not overloaded then
-        long_rtt = m.mean_rtt
+    local long_rtt = _M.usable_rtt(state.long_rtt) and state.long_rtt or nil
+    -- offset 0 with a probe still open is a skipped cycle: restore,
+    -- do not learn from whatever window happened to land there.
+    if offset == 0 then
+        return restore_probe(state, restore, long_rtt)
     end
-    return {
-        limit = restore,
-        long_rtt = long_rtt,
-        short_rtt = state.short_rtt,
-        gradient = state.gradient,
-        held = false,
-    }
+
+    local mean = m.mean_rtt
+    local learn = m.sample_count >= cfg.min_samples and not overloaded
+        and _M.usable_rtt(mean)
+        and probe_drained(mean, cfg.sample_window, offset)
+    if learn then
+        return restore_probe(state, restore, mean)
+    end
+    -- RTT still longer than the windows since the cut: keep the reduced
+    -- limit so a later window can be the clean sample. Give up at the
+    -- cap and restore the previous baseline unchanged.
+    if m.sample_count >= cfg.min_samples and not overloaded
+        and _M.usable_rtt(mean) and offset < PROBE_OFFSET_CAP then
+        return hold_probe(state, restore)
+    end
+    return restore_probe(state, restore, long_rtt)
 end
 
 function _M.probe_start(next_state, m, cfg)

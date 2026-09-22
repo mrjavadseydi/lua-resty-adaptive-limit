@@ -230,11 +230,12 @@ return nil, REJECTED
   thousands of repetitions).
 - A rejected request can never permanently raise `inflight`: the rollback
   decrement is unconditional; if a decrement ever returns a negative
-  value the excess is compensated with an atomic increment (never a
-  `set`, which would erase a sibling's concurrent admission) and a
-  counter anomaly is counted (this surfaces lost admissions rather than
-  hiding them). A non-finite counter (`-inf + 1 == -inf`) is snapped to
-  the slots this worker knows it holds.
+  value only **this call's** excess is compensated with an atomic
+  increment (`min(deducted, -n)`, never a `set`, which would erase a
+  sibling's concurrent admission) and a counter anomaly is counted.
+  Repairing the whole negative value would also fill a hole another
+  worker has not repaired yet. A non-finite counter is surfaced as
+  `inflight_corrupted` and left for the operator (§9).
 
 ### Semantics while the limit changes
 
@@ -328,9 +329,16 @@ Given window measurement `m` and current state:
 2. If `m.sample_count < min_samples` and explicit backoff did not trigger →
    hold (no update at all).
 3. `short_rtt' = sample_alpha * m.mean_rtt + (1 - sample_alpha) * short_rtt`
+   when `mean_rtt > 0`. A non-positive mean (sub-millisecond completions
+   recorded as 0 by `ngx.now()`) does not seed or move RTT state; a stored
+   non-positive RTT is treated as unset. Seeding 0 floors the gradient on
+   the next real sample and, once rejections freeze the baseline, pins the
+   limit at `min_limit` until a probe.
 4. Update `long_rtt` from `short_rtt'` only on app-limited windows (no
    rejections) that are not overloaded; seed it from the first sufficient
-   non-overloaded window either way. Under saturation the limit shapes the
+   non-overloaded window either way, including one that rejected, so a
+   cold limiter that is already the bottleneck still learns a healthy
+   backend. Under saturation the limit shapes the
    observed latency: a baseline learned there normalizes the queue, the
    gradient reads 1.0, headroom grows the limit, and only failures stop the
    ratchet (simulation I reproduces it: capacity 100, no timeouts,
@@ -342,12 +350,17 @@ Given window measurement `m` and current state:
    runs normally but is published at `limit' * probe_fraction` with the
    real `limit'` kept in `probe_restore`. The next window (`% == 1`) is
    polluted by requests admitted under the old limit (the publish lands
-   `aggregation_grace` into it) and holds; the one after ran entirely at
-   the probe limit, re-seeds `long_rtt` from its `mean_rtt` (up or down,
-   unless overloaded or below `min_samples`) and restores the limit.
+   `aggregation_grace` into it) and holds. A later window re-seeds
+   `long_rtt` from its `mean_rtt` only once that window is long enough to
+   have drained one RTT of pre-probe admissions
+   (`offset >= ceil(mean_rtt / sample_window) + 1`); until then the reduced
+   limit is held for up to three windows after the cut, then restored
+   **without** learning a still-queued RTT. An overloaded or undersampled
+   probe window restores immediately and keeps the previous baseline.
    Phases derive from the shared window number, so any worker can run any
-   phase. A window skipped during a probe simply restores on the next one
-   processed. (Same mechanism as Envoy adaptive concurrency's minRTT
+   phase. A window skipped during a probe restores on the next one
+   processed when that window is clean, and otherwise keeps holding.
+   (Same mechanism as Envoy adaptive concurrency's minRTT
    recalculation and BBR's PROBE_RTT; both controllers share it via
    `controller.common`.)
 5. `gradient = clamp(rtt_tolerance * long_rtt' / short_rtt', min_gradient, 1.0)`
@@ -412,7 +425,10 @@ operations, executed by at most one worker, once per `sample_window`.
   capacity until an operator acts:
   - the worker's heartbeat key expires → `workers_active` drops;
   - `inflight >= limit` combined with no completions for
-    `stale_threshold` seconds → `controller_stalled` in `state()`;
+    `stale_threshold` seconds → `controller_stalled` in `state()`.
+    The clock starts when this worker fills the pool (or on the first
+    `state()` call that observes it full), so a cold start is not
+    reported as hung before the threshold has elapsed;
   - no automatic reset ever runs (an unsynchronized "repair" while live
     requests modify the counter would corrupt it). The README documents the
     operator procedure: quiesce (or accept the shedding), then reset

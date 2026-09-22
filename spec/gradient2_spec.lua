@@ -219,6 +219,65 @@ describe("gradient2", function()
             healthy_window(100, 0), base_cfg()))
         assert.are.equal(1.0, next_state.gradient)
         assert.are.equal(105.0, next_state.limit)
+        -- a zero sample must not become the baseline
+        assert.is_nil(next_state.long_rtt)
+        assert.is_nil(next_state.short_rtt)
+    end)
+
+    it("does not floor the gradient after a zero-RTT window", function()
+        local cfg = base_cfg()
+        local state = { limit = 50 }
+        local zero = healthy_window(100, 0)
+        zero.rejected_count = 1
+        local seeded = assert(common.safe_update(g2, state, zero, cfg))
+        assert.are.equal(1.0, seeded.gradient)
+        assert.is_nil(seeded.long_rtt)
+        -- the next real sample is the first baseline, not a 4x spike
+        local m = healthy_window(100, 0.020)
+        local next_state = assert(common.safe_update(g2, state_of(seeded),
+            m, cfg))
+        assert.are.equal(1.0, next_state.gradient)
+        assert.True(near(next_state.long_rtt, 0.020))
+        assert.True(next_state.limit > seeded.limit)
+    end)
+
+    it("ignores a zero-mean window once a baseline exists", function()
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
+        local m = healthy_window(100, 0)
+        m.rejected_count = 0
+        local next_state = assert(common.safe_update(g2, state, m, base_cfg()))
+        assert.True(near(next_state.long_rtt, 0.020))
+        assert.True(near(next_state.short_rtt, 0.020))
+        assert.are.equal(1.0, next_state.gradient)
+        assert.are.equal(100, next_state.limit) -- no rejections, no headroom
+    end)
+
+    it("does not reseed a probe window that has not drained", function()
+        local cfg = base_cfg()
+        cfg.probe_interval = 30
+        cfg.probe_fraction = 0.5
+        cfg.sample_window = 1
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.044 }
+        local m = healthy_window(1000, 0.044)
+        m.window = 30
+        local started = assert(common.safe_update(g2, state, m, cfg))
+        assert.True(started.probe_restore ~= nil)
+        -- RTT is 1.5s and the window is 1s: offset 2 is still pre-probe
+        -- completions. Hold the reduced limit, keep the old baseline.
+        m.window = 32
+        m.mean_rtt = 1.5
+        local held = assert(common.safe_update(g2, state_of(started), m, cfg))
+        -- window 31 would be the polluted hold; 32 is offset 2
+        assert.True(held.held)
+        assert.True(near(held.long_rtt, started.long_rtt))
+        assert.True(near(held.probe_restore, started.probe_restore))
+        -- offset 3 has had ceil(1.5)+1 windows: the sample is clean
+        m.window = 33
+        m.mean_rtt = 0.030
+        local learned = assert(common.safe_update(g2, state_of(held), m, cfg))
+        assert.is_nil(learned.probe_restore)
+        assert.True(near(learned.long_rtt, 0.030))
+        assert.True(near(learned.limit, started.probe_restore))
     end)
 
     it("never exceeds max_limit", function()

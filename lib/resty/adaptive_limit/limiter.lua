@@ -126,6 +126,27 @@ local function non_finite(n)
     return n ~= n or n == math.huge or n == -math.huge
 end
 
+-- Undo only the excess this decrement introduced. `deducted` is the
+-- positive amount just subtracted; `n` is the resulting counter (< 0).
+-- Adding back -n would also fill a hole another worker has not repaired
+-- yet, and H overlapping excess releases would leave H*(H-1)/2 phantom
+-- slots that nobody holds — a full shed until the key is reset.
+-- min(deducted, -n) is this call's excess either way: the whole
+-- decrement when the counter was already negative, or the portion that
+-- crossed zero when it was not.
+local function repair_negative(self, n, deducted)
+    local repair = -n
+    if repair > deducted then
+        repair = deducted
+    end
+    local _, rerr = self.st.dict:incr(self.K_inflight, repair)
+    if rerr then
+        self.internal_errors = self.internal_errors + 1
+        rate_limited_log(self, "negative", ngx_WARN,
+            "inflight repair failed: ", rerr)
+    end
+end
+
 -- The inflight counter is gone (an unexpired key evicted under memory
 -- pressure — ngx.shared permits that — or a flushed dict) while requests
 -- still hold slots. Recreating it from zero would forget every held
@@ -392,16 +413,32 @@ function _M:try_acquire()
     if n <= limit then
         self._inflight = self._inflight + 1
         self.stats.admitted_total = self.stats.admitted_total + 1
+        -- Pool just filled. state() measures a hang from here, not from
+        -- the first time it is scraped.
+        if n == limit and not self._full_since then
+            self._full_since = ngx_now()
+        end
         return true
     end
 
     -- Over the limit: roll the reservation back unconditionally.
-    local _, rerr = dict:incr(self.K_inflight, -1)
-    if rerr then
+    -- The two incrs are not one atomic pair; a concurrent release can
+    -- drive the rollback result negative. Repair only this -1.
+    local rn, rerr = dict:incr(self.K_inflight, -1)
+    if not rn then
         self.internal_errors = self.internal_errors + 1
         count_anomaly(self, "rollback_failed")
         rate_limited_log(self, "rollback", ngx_ERR,
             "rollback incr failed: ", rerr)
+    elseif non_finite(rn) then
+        count_anomaly(self, "inflight_corrupted")
+        rate_limited_log(self, "inflight_corrupted", ngx_ERR,
+            "inflight counter corrupted (non-finite) during rollback")
+    elseif rn < 0 then
+        repair_negative(self, rn, 1)
+        count_anomaly(self, "negative_inflight")
+        rate_limited_log(self, "negative", ngx_WARN,
+            "inflight went negative during rollback")
     end
     self.stats.rejected_total = self.stats.rejected_total + 1
     return nil, errors.REJECTED
@@ -424,18 +461,16 @@ local function sanitize_latency(self, latency)
     return latency
 end
 
---- Release one slot and record the completion observation.
--- latency: seconds (number) or nil; outcome: see design.md §10.
--- Accounting happens before observation; observation failures can never
--- prevent the release (invariant 10).
-function _M:release(latency, outcome)
+-- Release the shared slot and the worker-local mirror. No observation
+-- work: log() records the outcome only after this returns, so a yielding
+-- classifier cannot hold the slot (invariant 10).
+local function release_slot(self)
     if not runtime.started then
         return nil, errors.NOT_STARTED
     end
 
     local dict = self.st.dict
 
-    -- 1. Release the slot. This must succeed for accounting to hold.
     local n, err = dict:incr(self.K_inflight, -1)
     if not n and err == "not found" then
         -- evicted while this slot was held: rebuild (our mirror still
@@ -455,22 +490,26 @@ function _M:release(latency, outcome)
         return inflight_corrupted(self, "incr(inflight, -1)", "non-finite")
     end
     if n < 0 then
-        -- Double release (or a lost admission): undo our own excess
-        -- decrement with an atomic incr rather than set(0) — another
-        -- worker may have admitted between the two operations, and a
-        -- set would erase that legitimate slot. Surface it.
+        -- Repair before the anomaly hook: the hook is user code and may
+        -- yield, and the counter must not sit negative across that yield.
+        repair_negative(self, n, 1)
         count_anomaly(self, "negative_inflight")
-        dict:incr(self.K_inflight, -n)
         rate_limited_log(self, "negative", ngx_WARN,
             "inflight went negative; double release suspected")
     end
     if self._inflight > 0 then
         self._inflight = self._inflight - 1
     end
+    local cap = self._last_limit
+    if self._full_since and type(cap) == "number" and n < cap then
+        self._full_since = nil
+    end
+    return true
+end
 
-    -- 2. Validate the observation. The slot is already released: an
-    --    outcome typo in one code path must never leak concurrency, so
-    --    it is dropped and surfaced instead of refused.
+local function record_observation(self, latency, outcome)
+    -- The slot is already released. An outcome typo must not leak
+    -- concurrency, so it is dropped and surfaced instead of refused.
     if outcome == nil then
         outcome = "success"
     elseif not OUTCOMES[outcome] then
@@ -520,6 +559,18 @@ function _M:release(latency, outcome)
     return true
 end
 
+--- Release one slot and record the completion observation.
+-- latency: seconds (number) or nil; outcome: see design.md §10.
+-- Accounting happens before observation; observation failures can never
+-- prevent the release (invariant 10).
+function _M:release(latency, outcome)
+    local ok, err = release_slot(self)
+    if not ok then
+        return nil, err
+    end
+    return record_observation(self, latency, outcome)
+end
+
 ------------------------------------------------------------------------
 -- Statistics flush (control path — called by the scheduler only)
 ------------------------------------------------------------------------
@@ -546,9 +597,9 @@ function _M:flush(now)
         local f = FLUSH_FIELDS[i]
         local delta = s[f] - flushed[f]
         if delta ~= 0 then
-            local ok, err = self.st:add_window(win, FIELD_TO_WINDOW[f],
+            local value, err = self.st:add_window(win, FIELD_TO_WINDOW[f],
                 delta, ttl)
-            if not ok then
+            if not value then
                 -- do not advance the marker: the delta is retried on
                 -- the next tick; surface the dict failure
                 self.internal_errors = self.internal_errors + 1
@@ -556,6 +607,14 @@ function _M:flush(now)
                     "window flush failed: ", err or "unknown")
                 self._flush_pending = win
                 return win
+            end
+            if err then
+                -- incr landed, expire did not. The marker must advance
+                -- or the next tick adds the same delta again. The key
+                -- has no TTL until a later write refreshes it.
+                self.internal_errors = self.internal_errors + 1
+                rate_limited_log(self, "flush", ngx_ERR,
+                    "window ttl refresh failed: ", err)
             end
             flushed[f] = flushed[f] + delta
         end
@@ -713,11 +772,18 @@ function _M:log()
         return true
     end
 
-    -- admitted: compute the observation (cheap, non-yielding), then
-    -- release() performs the accounting first and the recording second
-    local latency, outcome = default_observation(self)
+    -- Slot first, then the observation. default_observation runs user
+    -- code (outcome_classifier, on_anomaly) which may yield; the
+    -- concurrency slot must already be gone. The latch is set first so
+    -- a retry of log() cannot decrement twice when the release got as
+    -- far as the counter.
     ctx[self._ctx_key] = 2
-    return self:release(latency, outcome)
+    local ok, err = release_slot(self)
+    if not ok then
+        return nil, err
+    end
+    local latency, outcome = default_observation(self)
+    return record_observation(self, latency, outcome)
 end
 
 --- Convenience rejection response (optional, outside the core).
@@ -996,7 +1062,7 @@ function _M:exit_worker()
         return inflight_corrupted(self, "exit incr(inflight)", "non-finite")
     end
     if n < 0 then
-        dict:incr(self.K_inflight, -n) -- see release(): atomic, not set(0)
+        repair_negative(self, n, held)
     end
     self._inflight = 0
     count_anomaly(self, "exit_with_inflight", held)
@@ -1057,10 +1123,22 @@ function _M:state()
     -- worker has seen a completion for stale_threshold seconds. A
     -- completion-based controller cannot observe a fully hung backend;
     -- backpressure still holds, and this flag makes it visible.
-    local stalled = inflight ~= nil and limit ~= nil
-        and inflight >= limit
-        and (since_completion == nil
-             or since_completion > cfg.stale_threshold)
+    -- "Never completed" is not an infinite age: the clock starts when
+    -- this worker fills the pool (or, failing that, on the first look),
+    -- so a cold start that has not yet waited out the threshold is quiet.
+    local full = inflight ~= nil and limit ~= nil and inflight >= limit
+    if not full then
+        self._full_since = nil
+    end
+    local silent_for = since_completion
+    if silent_for == nil and full then
+        if not self._full_since then
+            self._full_since = now
+        end
+        silent_for = now - self._full_since
+    end
+    local stalled = full and silent_for ~= nil
+        and silent_for > cfg.stale_threshold
 
     -- last closed window's raw accumulators (shared view)
     local win = floor(now / cfg.sample_window) - 1

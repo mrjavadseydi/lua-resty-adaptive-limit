@@ -20,6 +20,13 @@
 -- All methods return library-level results; raw dict error strings are
 -- propagated to the caller (limiter.lua classifies them).
 
+-- expire() lives in lua-resty-core, not on the C shared-dict metatable.
+-- OpenResty after ngx_lua 0.10.15 loads that module by default; older
+-- builds and `lua_load_resty_core off` do not. Loading it here makes
+-- window TTLs work on the documented minimum version. Missing is fine
+-- (plain Lua unit tests); start() refuses a dict that still has no expire.
+pcall(require, "resty.core")
+
 local WINDOW_FIELDS = { "c", "s", "ovl", "tmo", "cer", "err", "abt", "rej",
     "cmp" }
 
@@ -89,13 +96,25 @@ end
 -- per-worker rollover state is needed. One extra expire per written
 -- field per tick — control-path cost only.
 function _M:add_window(n, field, delta, window_ttl)
+    local dict = self.dict
+    local expire = dict.expire
+    if type(expire) ~= "function" then
+        return nil, "shared dict expire() requires lua-resty-core"
+    end
     local keys = self:window_keys(n)
     local key = keys[field]
-    local value, err = self.dict:incr(key, delta, 0)
+    -- init TTL covers the gap before expire(). incr keeps an existing
+    -- key's TTL unchanged, so expire() refreshes it on every write.
+    local value, err = dict:incr(key, delta, 0, window_ttl)
     if not value then
         return nil, err
     end
-    self.dict:expire(key, window_ttl)
+    local ok, eerr = expire(dict, key, window_ttl)
+    if not ok then
+        -- The delta is in the accumulator. Returning nil here would make
+        -- flush retry the incr and double-count. The error is the TTL.
+        return value, eerr or "expire failed"
+    end
     return value
 end
 

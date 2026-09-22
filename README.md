@@ -109,8 +109,9 @@ limit is *not* the bottleneck (windows without rejections). Under
 saturation the limit itself shapes the latency, so learning from those
 windows would normalize the queue and ratchet the limit up until failures
 appear; instead, every `probe_interval` windows (30 s by default) the
-limit is published at `probe_fraction` (half) for two windows and the
-baseline is re-measured from the second — the same idea as Envoy's
+limit is published at `probe_fraction` (half) until in-flight requests
+from the old limit have drained, and the baseline is re-measured from
+that later window — the same idea as Envoy's
 adaptive-concurrency minRTT recalculation and BBR's PROBE_RTT. Expect a
 short, periodic dip in the published limit under sustained saturation;
 `state().probe_restore` shows the limit it will return to.

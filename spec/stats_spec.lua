@@ -170,16 +170,20 @@ describe("controller_stalled across workers", function()
         ngx._now = 1000
         assert.True(limiter:try_acquire()) -- pool exhausted
 
-        -- this worker never saw a completion, but worker 1 did recently
+        -- filling the pool starts the stall clock; it does not fire yet
+        assert.False(limiter:state().controller_stalled)
+        ngx._now = 1040
         assert.True(limiter:state().controller_stalled)
-        limiter.st:publish_last_completion(1, 990)
+        -- a sibling's recent completion clears it, even though this
+        -- worker itself has never completed
+        limiter.st:publish_last_completion(1, 1020)
         assert.False(limiter:state().controller_stalled)
 
         -- ticks publish this worker's own completion under its id
         assert.True(limiter:release(0.01))
-        limiter:tick(1000, 0)
-        assert.are.equal(1000, limiter.st:worker_last_completion(0))
-        assert.are.equal(990, limiter.st:worker_last_completion(1))
+        limiter:tick(1040, 0)
+        assert.are.equal(1040, limiter.st:worker_last_completion(0))
+        assert.are.equal(1020, limiter.st:worker_last_completion(1))
         ngx._worker_count = nil
     end)
 end)

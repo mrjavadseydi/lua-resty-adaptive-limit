@@ -84,6 +84,14 @@ function _M.start(opts)
             return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
                 "\": adopt shared state failed: " .. tostring(aerr)
         end
+        -- Window accumulators get their TTL from dict:expire, which
+        -- lua-resty-core installs. Without it every flush throws, the
+        -- controller never runs, and the same deltas are added again.
+        if type(limiter.st.dict.expire) ~= "function" then
+            runtime.started = false
+            return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
+                "\": shared dict has no expire(); lua-resty-core is required"
+        end
         -- first heartbeat before the scheduler's first tick, so worker
         -- liveness is correct from the moment start() returns
         local wid = ngx.worker.id()

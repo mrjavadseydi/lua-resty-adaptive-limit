@@ -41,11 +41,11 @@
 --
 -- Insufficient latency samples hold the RTT state and limit unless enough
 -- explicit failures independently trigger overload backoff.
--- short' == 0 (all zero-RTT samples, e.g. a mock backend) is treated as
--- perfectly healthy: gradient 1, no division performed.
+-- A non-positive mean (sub-millisecond completions recorded as 0) does
+-- not seed or move RTT state. With no positive baseline the gradient
+-- stays 1 and no division is performed.
 
 local clamp = require("resty.adaptive_limit.util.clamp")
-local ewma = require("resty.adaptive_limit.util.ewma")
 local common = require("resty.adaptive_limit.controller.common")
 
 local math_sqrt = math.sqrt
@@ -74,41 +74,29 @@ function _M.update(state, m, cfg)
     if sc < cfg.min_samples and not backoff then
         return {
             limit = limit,
-            long_rtt = state.long_rtt,
-            short_rtt = state.short_rtt,
+            long_rtt = common.usable_rtt(state.long_rtt) and state.long_rtt
+                or nil,
+            short_rtt = common.usable_rtt(state.short_rtt) and state.short_rtt
+                or nil,
             gradient = state.gradient,
             held = true,
         }
     end
 
-    local short_rtt = state.short_rtt
-    local long_rtt = state.long_rtt
-    if sc >= cfg.min_samples and short_rtt == nil then
-        -- First sufficient window seeds the RTT state directly instead
-        -- of pretending some default RTT was observed.
-        short_rtt = m.mean_rtt
-    elseif sc >= cfg.min_samples then
-        short_rtt = ewma(short_rtt, m.mean_rtt, cfg.sample_alpha)
-    end
-
     -- strong overload signals only: 503s, timeouts and upstream connect
     -- failures; plain application errors (500-class) are never treated
-    -- as capacity signals (design.md §4)
-    -- The baseline is frozen on overloaded windows — including the very
-    -- first one: seeding it from an overloaded RTT (restart mid-incident)
-    -- would teach the controller that the overload is "healthy". With no
-    -- baseline yet the gradient stays 1.0 and only the overload backoff
-    -- acts; the first healthy window seeds it (even a saturated one:
-    -- without a baseline nothing bounds growth until the first probe).
-    if sc >= cfg.min_samples and not overloaded
-        and (m.rejected_count == 0 or long_rtt == nil) then
-        long_rtt = ewma(long_rtt, short_rtt, cfg.baseline_alpha)
-    end
+    -- as capacity signals (design.md §4). The baseline is frozen on
+    -- overloaded windows — including the very first one: seeding it from
+    -- an overloaded RTT (restart mid-incident) would teach the controller
+    -- that the overload is "healthy". The first usable non-overloaded
+    -- window seeds it, rejections included, so a cold limiter that is
+    -- already the bottleneck still learns a healthy backend.
+    local short_rtt, long_rtt = common.observe_rtt(state, m, cfg, overloaded)
 
     local gradient = state.gradient
     if sc >= cfg.min_samples then
         gradient = 1.0
-        if long_rtt ~= nil and short_rtt > 0 then
+        if common.usable_rtt(long_rtt) and common.usable_rtt(short_rtt) then
             gradient = clamp(cfg.rtt_tolerance * long_rtt / short_rtt,
                              cfg.min_gradient, 1.0)
         end

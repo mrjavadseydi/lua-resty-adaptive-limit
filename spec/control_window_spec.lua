@@ -274,4 +274,18 @@ describe("control_window measurement validation", function()
 
             ngx.worker.id = orig_id
         end)
+
+    it("refuses to start when the shared dict cannot expire keys", function()
+        runtime.started = false
+        runtime.registry = {}
+        runtime.order = {}
+        ngx.reset()
+        local dict = ngx.make_dict()
+        dict.expire = nil
+        ngx.shared.adaptive_limit = dict
+        assert(adaptive.new({ name = "pay", shared_dict = "adaptive_limit" }))
+        local ok, err = adaptive.start()
+        assert.falsy(ok)
+        assert.True(tostring(err):find("expire", 1, true) ~= nil)
+    end)
 end)

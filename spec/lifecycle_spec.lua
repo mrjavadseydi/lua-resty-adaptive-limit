@@ -58,6 +58,21 @@ describe("access/log lifecycle", function()
         assert.Nil(limiter.anomalies.negative_inflight)
     end)
 
+    it("releases the slot before the outcome classifier runs", function()
+        local seen
+        local limiter = fresh_limiter({
+            outcome_classifier = function()
+                seen = ngx.shared.adaptive_limit._data["al:1:pay:inflight"]
+                return "success"
+            end,
+        })
+        assert.True(limiter:access())
+        assert.True(limiter:log())
+        assert.are.equal(0, seen)
+        assert.are.equal(0, ngx.shared.adaptive_limit
+            ._data["al:1:pay:inflight"])
+    end)
+
     it("log() without access() is a harmless no-op", function()
         local limiter = fresh_limiter()
         assert.True(limiter:log())
