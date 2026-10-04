@@ -20,7 +20,7 @@ allow / reject            latency + outcome observations
 upstream
 ```
 
-Status: **0.1.0** — initial release, with
+Status: **0.1.1** — early release (see [CHANGELOG.md](CHANGELOG.md)), with
 multi-worker race tests, deterministic controller simulations, a
 real-traffic reload/SIGKILL harness, and published benchmarks. It is young
 software; read the failure behavior and limitations before deploying it.
@@ -39,9 +39,14 @@ software; read the failure behavior and limitations before deploying it.
 ## Installation
 
 OpenResty ≥ **1.15.8.1** (the library uses `exit_worker_by_lua*`,
-available since lua-nginx-module 0.10.15). No other runtime dependencies.
+available since lua-nginx-module 0.10.15). No other runtime dependencies
+(lua-resty-core, which OpenResty bundles, is loaded automatically).
 
-After a LuaRocks release: `luarocks install lua-resty-adaptive-limit`.
+```bash
+luarocks install lua-resty-adaptive-limit             # LuaRocks
+opm get mrjavadseydi/lua-resty-adaptive-limit         # OpenResty Package Manager
+luarocks install --dev lua-resty-adaptive-limit       # unreleased main branch
+```
 
 Or copy `lib/resty/adaptive_limit.lua` and `lib/resty/adaptive_limit/`
 into your `lua_package_path`.

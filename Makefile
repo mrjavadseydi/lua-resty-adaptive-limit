@@ -18,7 +18,7 @@ RUN    := docker run --rm -v $(CURDIR):/work -w /work $(IMAGE)
 # Test::Nginx scratch lives outside the repo mount so repeated runs stay clean.
 TEST_ENV := TEST_NGINX_SERVROOT=/tmp/adlim-servroot TEST_NGINX_RANDOM_DELAY=off
 
-.PHONY: image image-if-missing test test-unit test-integration sim bench soak resilience shell clean
+.PHONY: image image-if-missing test test-unit test-integration sim bench soak resilience shell clean release-check
 
 image:
 	docker build -t $(IMAGE) --build-arg OPENRESTY_IMAGE=$(OPENRESTY_IMAGE) -f docker/Dockerfile.test .
@@ -62,3 +62,9 @@ shell: | image-if-missing
 
 clean:
 	rm -rf t/servroot* benchmark/tmp
+
+# Versions, rockspecs, CHANGELOG and README agree before tagging vVERSION
+# (the release workflow runs the same check): make release-check VERSION=0.1.1
+release-check:
+	@test -n "$(VERSION)" || { echo "usage: make release-check VERSION=x.y.z"; exit 2; }
+	@bash scripts/check-release.sh $(VERSION)

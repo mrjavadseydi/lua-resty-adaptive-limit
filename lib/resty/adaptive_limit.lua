@@ -24,7 +24,7 @@ local runtime = require("resty.adaptive_limit.runtime")
 local ngx_get_phase = ngx.get_phase
 
 local _M = {
-    _VERSION = "0.1.0",
+    _VERSION = "0.1.1",
     errors = errors,
 }
 

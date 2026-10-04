@@ -1,8 +1,8 @@
 package = "lua-resty-adaptive-limit"
-version = "0.1.0-1"
+version = "dev-1"
 source = {
     url = "git+https://github.com/mrjavadseydi/lua-resty-adaptive-limit.git",
-    tag = "v0.1.0",
+    branch = "main",
 }
 
 description = {
@@ -14,11 +14,12 @@ from observed completion latency and explicit overload signals, so
 excess load is shed early instead of piling onto a saturating backend.
 
 O(1) request-path admission on top of atomic lua_shared_dict
-operations (~0.25us/op measured), one scheduler timer per worker,
-deterministic windows with lease-based single-leader controller
+operations (~0.22us per admission measured), one scheduler timer per
+worker, deterministic windows with lease-based single-leader controller
 updates, Gradient2 (default) and AIMD controllers, graceful-reload
 state preservation, worker-exit reconciliation, stuck-pool
-diagnostics, and no runtime dependencies beyond OpenResty >= 1.15.8.1.
+diagnostics, and no runtime dependencies beyond OpenResty >= 1.15.8.1
+and the lua-resty-core it bundles.
 ]],
    homepage = "https://github.com/mrjavadseydi/lua-resty-adaptive-limit",
    license = "MIT",

@@ -46,6 +46,29 @@ API simplicity.
 4. Pull requests: describe the behavior change and its effect on the
    invariants in design.md.
 
+## Releasing
+
+Versions follow SemVer; `_VERSION` in `lib/resty/adaptive_limit.lua` is
+the single source of truth (OPM reads it directly).
+
+1. Move the `[Unreleased]` CHANGELOG entries into a dated
+   `## [x.y.z] — YYYY-MM-DD` section and add its compare link.
+2. Bump `_VERSION`, update the README status line, and
+   `git mv` the root rockspec to `lua-resty-adaptive-limit-x.y.z-1.rockspec`
+   (`version` and `source.tag`). A new module goes into **both** that
+   rockspec and `lua-resty-adaptive-limit-dev-1.rockspec`.
+3. `make release-check VERSION=x.y.z && make test`, commit.
+4. `git tag -a vx.y.z -m vx.y.z && git push origin main vx.y.z`.
+
+The tag triggers `.github/workflows/release.yml`: the same consistency
+check, the full CI suite, then a GitHub Release (notes = the CHANGELOG
+section), LuaRocks and OPM uploads. The uploads need repository secrets
+`LUAROCKS_API_KEY` and `OPM_GITHUB_TOKEN` (a GitHub token with `read:org`
+and `user:email` scopes for the publishing account); a job whose secret
+is missing is skipped with a warning. Manual fallback:
+`luarocks upload lua-resty-adaptive-limit-x.y.z-1.rockspec --api-key=…`
+and `opm upload` (configured in `~/.opmrc`).
+
 ## Reporting bugs
 
 Include: OpenResty version (`resty -V`), a minimal nginx.conf, the
