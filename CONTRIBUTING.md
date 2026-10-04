@@ -21,7 +21,7 @@ API simplicity.
   them in well under a second — it must be built for LuaJIT/Lua 5.1
   (`luarocks --lua-version=5.1 install busted`), since the code is
   Lua 5.1 only; `.busted` sets the paths. Controller changes must
-  additionally pass `make sim` (scenarios A–H).
+  additionally pass `make sim` (scenarios A–I).
 - **No request-path costs without proof.** The fast path is measured in
   `benchmark/microbench.lua`. An allocation, a string concatenation, an
   extra dict operation, a regex, or a yield on the admission/release path

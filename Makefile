@@ -41,7 +41,7 @@ test-integration: | image-if-missing
 
 test: test-unit test-integration
 
-# Deterministic controller simulations (scenarios A–H)
+# Deterministic controller simulations (scenarios A–I)
 sim: SPEC = spec/simulation_spec.lua
 sim: test-unit
 

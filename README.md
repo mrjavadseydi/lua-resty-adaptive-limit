@@ -249,7 +249,9 @@ yourself.
 
 Convenience helper for producing the standard rejection response:
 maps `"rejected"` to the configured status (503 by default) with a
-`Retry-After` header; internal errors map to 500.
+`Retry-After` header; internal errors map to 500. 503 signals backend
+capacity exhaustion; set `rejection_status = 429` only if your clients
+treat shedding as a per-client quota.
 
 ### `limiter:state() -> table`
 
@@ -460,6 +462,9 @@ repetition's number, including noisy runs, is listed in
 * `log_by_lua` does not run for subrequests (platform behavior); the
   lifecycle helper relies on the documented redirect semantics pinned in
   `t/lifecycle.t`.
+* **HTTP subsystem only.** `access`/`log`/`guard`/`enforce` use
+  `ngx.req`, `ngx.var` and `ngx.exit` from the HTTP subsystem;
+  `ngx_stream_lua` is untested and unsupported.
 
 ## Security considerations
 
@@ -477,7 +482,7 @@ make test-unit                          # busted specs (local busted if installe
 make test-unit SPEC=spec/gradient2_spec.lua
 make test-integration T=t/admission.t   # Test::Nginx (always Docker)
 make test                               # both
-make sim                                # deterministic controller simulations A–H
+make sim                                # deterministic controller simulations A–I
 make shell                              # a shell inside the harness image
 make bench / make resilience / SOAK_SECONDS=600 make soak
 ```
