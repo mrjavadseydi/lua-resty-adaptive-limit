@@ -9,6 +9,7 @@ use Test::Nginx::Socket 'no_plan';
 
 repeat_each(1);
 workers(2);
+master_process_enabled('on');
 timeout(30);
 
 run_tests();

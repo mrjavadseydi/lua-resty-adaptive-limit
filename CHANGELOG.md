@@ -6,6 +6,24 @@ All notable changes are documented here. Format based on
 
 ## [Unreleased]
 
+### Fixed
+- Missing inflight counters remain errors until safely reset; recovery
+  no longer forgets sibling workers' holdings and exceeds the cap.
+- A limiter-wide controller lease orders publications across windows,
+  including concurrent startup ticks, with owner checks before publishing.
+- Stored window-size metadata prevents reloads from freezing adaptation
+  after `sample_window` changes.
+- Active probes back off on explicit overload and restore only after
+  enough healthy, positive latency observations.
+- Startup propagates shared-state initialization and adoption write
+  failures; concurrent initialization preserves already published state.
+
+### Upgrade notes
+- Changing `sample_window` requires a full stop/start. Upgrading from
+  0.1.1 or earlier also requires a full stop/start because existing shared
+  state has no window-size metadata. Matching-window reloads preserve the
+  learned limit after that upgrade.
+
 ## [0.1.1] — 2026-10-04
 
 Bug-fix release. No new options, no API changes, and no shared-state

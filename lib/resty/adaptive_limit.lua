@@ -52,6 +52,7 @@ function _M.start(opts)
     end
 
     opts = opts or {}
+    runtime.started = false
     if opts.flush_interval ~= nil then
         if type(opts.flush_interval) ~= "number"
             or opts.flush_interval ~= opts.flush_interval
@@ -65,18 +66,19 @@ function _M.start(opts)
     local order = runtime.order
     for i = 1, #order do
         local limiter = order[i]
-        local ok, err = limiter:check_schema()
+        local ok, err, detail = limiter:check_schema()
         if not ok then
             -- INVALID_STATE (foreign schema) is a hard error: silently
             -- re-initializing would discard a learned limit.
             if err == errors.INVALID_STATE then
                 runtime.started = false
                 return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
-                    "\": incompatible shared state schema (expected version " ..
-                    tostring(state_mod.SCHEMA_VERSION) .. ")"
+                    "\": " .. (detail or
+                    "incompatible shared state schema (expected version " ..
+                    tostring(state_mod.SCHEMA_VERSION) .. ")")
             end
             return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
-                "\": schema check failed: " .. tostring(err)
+                "\": schema check failed: " .. tostring(detail or err)
         end
         local adopted, aerr = limiter:adopt_shared_state()
         if not adopted and aerr then

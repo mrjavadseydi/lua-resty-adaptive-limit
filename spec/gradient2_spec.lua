@@ -130,11 +130,12 @@ describe("gradient2", function()
         m.rejected_count = 0
         assert.is_nil(common.safe_update(g2, state, m, cfg).probe_restore)
         m.rejected_count = 1
-        -- an overloaded probe window learns nothing but still restores
+        -- an overloaded probe window takes backoff at the reduced limit
         m.window = 32
         m.overload_count = 500
         local s5 = assert(common.safe_update(g2, state_of(s3), m, cfg))
         assert.is_nil(s5.probe_restore)
+        assert.True(s5.limit < s3.limit)
         assert.True(near(s5.long_rtt, 0.020))
     end)
 

@@ -147,24 +147,15 @@ local function repair_negative(self, n, deducted)
     end
 end
 
--- The inflight counter is gone (an unexpired key evicted under memory
--- pressure — ngx.shared permits that — or a flushed dict) while requests
--- still hold slots. Recreating it from zero would forget every held
--- slot and break the cap; the value this worker can vouch for is its
--- own mirror, so the counter is rebuilt from that lower bound (add: the
--- first worker to notice wins, siblings then incr on top). Sibling
--- holdings admitted before the loss are missing until they drain: each
--- such release drives the counter below zero and is compensated there
--- (negative_inflight), so the counter is exact again once the
--- pre-eviction requests have completed. An acquire that discovers the
--- loss fails as an internal error so it is visible and failure_mode
--- decides that request; a release completes against the rebuilt counter.
-local function rebuild_inflight(self)
+-- Missing distributed state cannot be reconstructed from one worker's
+-- mirror. Failed releases also leave local mirrors pending; a full restart
+-- after quiescing traffic clears those mirrors as well as the shared state.
+local function inflight_missing(self, where)
     count_anomaly(self, "inflight_missing")
-    self.st.dict:add(self.K_inflight, self._inflight)
     rate_limited_log(self, "inflight_missing", ngx_ERR,
-        "inflight counter missing (evicted?); rebuilt from this worker's ",
-        tostring(self._inflight), " held slots")
+        "inflight counter missing (evicted?); not repaired — ",
+        "fully restart nginx once traffic is quiesced")
+    return internal_error(self, where, "inflight missing")
 end
 
 function _M.new(user_cfg)
@@ -254,20 +245,30 @@ end
 function _M:reseed_shared_state()
     local st = self.st
     local cfg = self.cfg
-
-    st:write_schema()
-
-    -- A fresh limiter starts at initial_limit. A restart with existing
-    -- state adopts it (checked by the caller before calling this).
-    self.st.dict:set(self.K_limit, cfg.initial_limit)
-    self.st.dict:set(st.K.limit_f, cfg.initial_limit)
-    -- add, not set: a sibling worker may already be serving requests by
-    -- the time this worker runs its init; zeroing a live counter would
-    -- over-admit until the next negative-inflight snap
-    self.st.dict:add(st.K.inflight, 0)
-    self.st.dict:set(st.K.last_window, 0)
-    self.st.dict:set(st.K.last_update, ngx_now())
-    self._last_limit = cfg.initial_limit
+    local learned, lerr = st.dict:get(st.K.limit_f)
+    if learned == nil and lerr and lerr ~= "not found" then
+        return nil, lerr
+    end
+    local limit = cfg.initial_limit
+    if type(learned) == "number" and not non_finite(learned) then
+        limit = math.max(cfg.min_limit, math.min(cfg.max_limit, learned))
+    end
+    -- Concurrent first workers must not overwrite a sibling's live state.
+    local seeds = {
+        { st.K.limit_f, limit },
+        { st.K.inflight, 0 },
+        { st.K.last_window, 0 },
+        { st.K.last_update, ngx_now() },
+        { self.K_limit, floor(limit) },
+    }
+    for i = 1, #seeds do
+        local ok, err = st.dict:add(seeds[i][1], seeds[i][2])
+        if not ok and err ~= "exists" then
+            return nil, err or errors.INTERNAL_ERROR
+        end
+    end
+    self._last_limit = limit
+    return true
 end
 
 -- Validate the shared state schema marker and this limiter's own keys;
@@ -288,8 +289,13 @@ function _M:check_schema()
             return nil, errors.INTERNAL_ERROR
         end
         -- no marker: first worker here, or the dict was flushed
-        st:write_schema()
-    elseif v ~= tostring(state_mod.SCHEMA_VERSION) then
+        local ok, werr = st:write_schema()
+        if not ok and werr ~= "exists" then
+            return nil, errors.INTERNAL_ERROR, werr
+        end
+        v = st:read_schema()
+    end
+    if v ~= tostring(state_mod.SCHEMA_VERSION) then
         rate_limited_log(self, "schema", ngx_ERR,
             "shared state schema version ", tostring(v),
             " is not supported (expected ", tostring(state_mod.SCHEMA_VERSION),
@@ -299,11 +305,41 @@ function _M:check_schema()
 
     -- per-limiter key existence (second+ limiters in a shared zone)
     local limit, lerr = dict:get(self.K_limit)
-    if limit == nil then
-        if lerr and lerr ~= "not found" then
-            return nil, errors.INTERNAL_ERROR
+    if limit == nil and lerr and lerr ~= "not found" then
+        return nil, errors.INTERNAL_ERROR, lerr
+    end
+    local sw, werr = dict:get(st.K.sample_window)
+    if sw == nil then
+        if werr and werr ~= "not found" then
+            return nil, errors.INTERNAL_ERROR, werr
         end
-        self:reseed_shared_state()
+        -- Legacy state has no cadence marker; guessing would mix IDs
+        -- from draining old workers with the new worker's windows.
+        if limit ~= nil or dict:get(st.K.last_update) ~= nil then
+            return nil, errors.INVALID_STATE,
+                "shared state has no sample_window metadata; a full restart is required"
+        end
+        local ok, aerr = dict:add(st.K.sample_window, self.cfg.sample_window)
+        if not ok and aerr ~= "exists" then
+            return nil, errors.INTERNAL_ERROR, aerr
+        end
+        sw = dict:get(st.K.sample_window)
+    end
+    if sw ~= self.cfg.sample_window then
+        return nil, errors.INVALID_STATE,
+            "sample_window changed from " .. tostring(sw) .. " to " ..
+            tostring(self.cfg.sample_window) .. "; a full restart is required"
+    end
+    if dict:get(st.K.inflight) == nil
+        and (limit ~= nil or dict:get(st.K.last_update) ~= nil) then
+        return nil, errors.INTERNAL_ERROR,
+            "inflight counter missing; fully restart once traffic is quiesced"
+    end
+    if limit == nil then
+        local ok, rerr = self:reseed_shared_state()
+        if not ok then
+            return nil, errors.INTERNAL_ERROR, rerr
+        end
     end
     return true
 end
@@ -321,9 +357,7 @@ function _M:adopt_shared_state()
     -- prefer the float controller state; fall back to the integer limit
     local adopted = cs.limit_f or cs.limit
     if adopted == nil or type(adopted) ~= "number" or adopted ~= adopted then
-        -- absent or corrupt: fall back to a reseed
-        self:reseed_shared_state()
-        return self.cfg.initial_limit
+        adopted = self.cfg.initial_limit
     end
     local clamped = adopted
     if adopted < self.cfg.min_limit then
@@ -331,13 +365,14 @@ function _M:adopt_shared_state()
     elseif adopted > self.cfg.max_limit then
         clamped = self.cfg.max_limit
     end
-    if clamped ~= adopted then
+    if cs.limit ~= floor(clamped) or cs.limit_f ~= clamped then
         -- Out-of-policy adopted state (e.g. max_limit lowered across a
         -- reload): publish the clamp immediately so admission is bounded
         -- from the first request, not just from the next controller
         -- window.
-        st.dict:set(self.K_limit, floor(clamped))
-        st.dict:set(st.K.limit_f, clamped)
+        local ok, werr = st.dict:set(self.K_limit, floor(clamped))
+        if ok then ok, werr = st.dict:set(st.K.limit_f, clamped) end
+        if not ok then return nil, werr or errors.INTERNAL_ERROR end
     end
     self._last_limit = clamped
     return clamped
@@ -395,8 +430,7 @@ function _M:try_acquire()
         if ierr == "not a number" then
             return inflight_corrupted(self, "incr(inflight)", "non-numeric")
         elseif ierr == "not found" then
-            rebuild_inflight(self)
-            return internal_error(self, "incr(inflight)", "inflight missing")
+            return inflight_missing(self, "incr(inflight)")
         end
         return internal_error(self, "incr(inflight)", ierr)
     end
@@ -473,10 +507,7 @@ local function release_slot(self)
 
     local n, err = dict:incr(self.K_inflight, -1)
     if not n and err == "not found" then
-        -- evicted while this slot was held: rebuild (our mirror still
-        -- counts the slot) and release against the rebuilt counter
-        rebuild_inflight(self)
-        n, err = dict:incr(self.K_inflight, -1)
+        return inflight_missing(self, "incr(inflight, -1)")
     end
     if not n then
         -- The slot leaks; surfaced via internal_errors and the stuck
@@ -873,13 +904,6 @@ function _M:control(now)
     -- pause.
     local from = last + 1
     if n_ready - from + 1 > MAX_WINDOWS_PER_TICK then
-        -- Jumping ahead while another worker still holds the lease on
-        -- last+1 would publish a later window before an earlier one
-        -- (last_window regresses, the newer limit is overwritten). Its
-        -- publish advances last_window; wait for it.
-        if last > 0 and st:lease_held(from) then
-            return
-        end
         from = n_ready - MAX_WINDOWS_PER_TICK + 1
         if last > 0 then
             local skipped = from - last - 1
@@ -897,20 +921,14 @@ function _M:control(now)
     end
 end
 
---- Process exactly one closed window. Returns false when the caller
--- should stop (lease lost, dict failure); true otherwise (including
--- "held: insufficient samples").
-function _M:control_window(n, now)
+local function control_window(self, n, now, owner)
     local cfg = self.cfg
     local st = self.st
-    local dict = st.dict
 
     -- Controller lease: add wins. TTL-only expiry — we never delete a
     -- lease, so a successor lease for a later window is never disturbed,
     -- and last_window makes re-processing impossible anyway.
-    local ok = st:try_lease(n,
-        tostring(ngx.worker and ngx.worker.pid() or 0) .. ":" .. tostring(n),
-        LEASE_TTL)
+    local ok = st:try_lease(n, owner, LEASE_TTL)
     if not ok then
         self.controller_skips = (self.controller_skips or 0) + 1
         return false
@@ -999,6 +1017,12 @@ function _M:control_window(n, now)
         self.controller_skips = (self.controller_skips or 0) + 1
     end
 
+    -- A stalled worker must abandon work if its limiter-wide lease expired.
+    if not st:controller_lease_owned(owner) then
+        count_anomaly(self, "stale_controller_window")
+        self.controller_skips = (self.controller_skips or 0) + 1
+        return false
+    end
     local pok, perr = st:publish_controller_state(next_state.limit,
         next_state.long_rtt, next_state.short_rtt, next_state.gradient,
         next_state.probe_restore, n, now)
@@ -1033,6 +1057,29 @@ function _M:control_window(n, now)
         })
     end
     return true
+end
+
+--- Process one closed window while holding the limiter-wide lease.
+-- The TTL recovers controller leadership after worker death; normal
+-- completion releases it immediately so the next window need not wait.
+function _M:control_window(n, now)
+    local st = self.st
+    self._controller_seq = (self._controller_seq or 0) + 1
+    local owner = tostring(ngx.worker and ngx.worker.pid() or 0) .. ":" ..
+        tostring(n) .. ":" .. tostring(self._controller_seq)
+    local acquired, err = st:try_controller_lease(owner, LEASE_TTL)
+    if not acquired then
+        self.controller_skips = (self.controller_skips or 0) + 1
+        if err ~= "exists" then
+            internal_error(self, "controller lease", err)
+        end
+        return false
+    end
+    -- Clean up even if an algorithm throws; the scheduler reports the error.
+    local ok, result = pcall(control_window, self, n, now, owner)
+    st:release_controller_lease(owner)
+    if not ok then error(result, 0) end
+    return result
 end
 
 ------------------------------------------------------------------------

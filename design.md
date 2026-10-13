@@ -130,7 +130,7 @@ with a descriptive error — never silently accepted.
 | `initial_limit` | number | 50 | cold-start limit; `min_limit <= initial_limit <= max_limit` |
 | `min_limit` | number | 1 | `>= 1` |
 | `max_limit` | number | 2000 | `>= min_limit` |
-| `sample_window` | number | 1.0 | controller window seconds; `> 0` |
+| `sample_window` | number | 1.0 | controller window seconds; `> 0`; changing it requires a full stop/start |
 | `aggregation_grace` | number | 0.35 | seconds after window close before it is processed |
 | `min_samples` | number | 20 | minimum usable latency samples for an RTT update |
 | `failure_mode` | string | `"fail_open"` | or `"fail_closed"`, see §9 |
@@ -355,8 +355,11 @@ Given window measurement `m` and current state:
    have drained one RTT of pre-probe admissions
    (`offset >= ceil(mean_rtt / sample_window) + 1`); until then the reduced
    limit is held for up to three windows after the cut, then restored
-   **without** learning a still-queued RTT. An overloaded or undersampled
-   probe window restores immediately and keeps the previous baseline.
+   **without** learning a still-queued RTT, provided it has sufficient
+   healthy, positive latency samples. Undersampled probe windows keep
+   holding. An overloaded probe cancels restoration and takes normal
+   overload handling at the reduced limit; overloaded windows never start
+   a new probe.
    Phases derive from the shared window number, so any worker can run any
    phase. A window skipped during a probe restores on the next one
    processed when that window is clean, and otherwise keeps holding.
@@ -385,15 +388,23 @@ latency sample. AIMD uses the same baseline, clamp, and safety rules.
 
 ### Publication
 
+One limiter-wide lease serializes publications from different windows.
+It expires after five seconds for worker-death recovery and is released
+on normal completion or an exception, only while its owner token matches.
+Per-window leases still prevent duplicate processing. Before publication,
+the worker verifies that it still owns the limiter-wide lease.
+
 The lease holder writes `limit`, `long_rtt`, `short_rtt`, `gradient`,
 `probe_restore`, `last_window`, `last_update` (7 `set`/`delete` ops) and
 deletes the processed window keys. Before computing, it re-reads
 `last_window` under the lease and abandons the window if it is already
 `>= n` (`stale_controller_window` anomaly): a worker stalled past
 `lease_ttl` must not publish over a sibling's later windows (the lease
-orders leadership, not publication). The residual race — a stall between
-that re-read and the publish — is what a shared dict without compare-and-set
-cannot close; it needs a pause of seconds inside a non-yielding block. Controller work per limiter per window is ~10–20 shared-dict
+orders leadership, not publication). The residual lease-expiry race — a
+stall between the final ownership check and the writes or lease cleanup —
+is what a shared dict without compare-and-set cannot close; it needs a
+pause beyond the lease lifetime inside a non-yielding block. Controller
+work per limiter per window is a fixed number of shared-dict
 operations, executed by at most one worker, once per `sample_window`.
 
 ## 9. Failure model
@@ -433,14 +444,13 @@ operations, executed by at most one worker, once per `sample_window`.
     requests modify the counter would corrupt it). The README documents the
     operator procedure: quiesce (or accept the shedding), then reset
     `inflight` from an admin snippet. An *evicted* `inflight` key (the
-    dictionary may drop unexpired entries under memory pressure) is the
-    one case rebuilt automatically, and never from zero: `incr` runs
-    without an init value, a `not found` is counted (`inflight_missing`),
-    the key is re-created with `add(this worker's held count)` — the
-    only value the worker can vouch for — and the discovering acquire
-    fails as an internal error. Sibling holdings admitted before the loss
-    surface as negative-inflight compensations as they drain, after which
-    the counter is exact again. The same rule covers a *corrupted*
+    dictionary may drop unexpired entries under memory pressure) is lost
+    distributed state: `incr` runs without an init value, a `not found`
+    is counted (`inflight_missing`), and both acquisition and release fail
+    as internal errors without recreating the key. One worker's mirror
+    cannot account for sibling holdings. Recovery after counter loss is
+    a full restart with traffic quiesced, so pending local mirrors from
+    failed releases are cleared too. The same rule covers a *corrupted*
     `inflight` (foreign non-numeric or non-finite write): surfaced as
     `inflight_corrupted` + `internal_error`, governed by `failure_mode`,
     never re-seeded by the library. The `limit` key is different: a
@@ -453,11 +463,20 @@ operations, executed by at most one worker, once per `sample_window`.
 ### Graceful reload
 
 The shared dictionary survives HUP. New workers validate the schema marker
-and adopt the learned `limit`/RTT state — a healthy limit is never
+and stored `sample_window`, then adopt the learned `limit`/RTT state — a
+healthy limit is never
 deliberately discarded by a reload. Old workers drain and reconcile via
 `exit_worker`. `t/resilience.t` and `benchmark/resilience.sh` hammer this with continuous traffic: no
 permanent lockout, no negative counters, no runaway admission, no schema
 corruption.
+
+Changing `sample_window` changes epoch-based window IDs and requires a
+full stop/start. Startup rejects a different stored window size before
+modifying controller state. Legacy state without this marker also needs
+a full stop/start when upgrading; its cadence cannot safely be guessed
+while old workers drain. Initial key creation uses checked atomic adds
+so concurrent first workers preserve a sibling's published state and held
+slots. Startup also checks writes that repair or clamp adopted limits.
 
 **Reload-overlap note:** during a graceful reload where code changes the
 measurement schema (such as the addition of `completions`), draining old

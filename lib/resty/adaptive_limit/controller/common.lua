@@ -224,6 +224,13 @@ function _M.probe_step(state, m, cfg, overloaded)
     if restore == nil or interval <= 0 or m.window == nil then
         return nil
     end
+    -- Explicit failures take the normal backoff path at the reduced limit.
+    if overloaded then
+        return nil
+    end
+    if m.sample_count < cfg.min_samples or not _M.usable_rtt(m.mean_rtt) then
+        return hold_probe(state, restore)
+    end
     local offset = m.window % interval
     -- The publish lands in the next window; that window is polluted by
     -- admissions taken at the old limit.
@@ -254,9 +261,10 @@ function _M.probe_step(state, m, cfg, overloaded)
     return restore_probe(state, restore, long_rtt)
 end
 
-function _M.probe_start(next_state, m, cfg)
+function _M.probe_start(next_state, m, cfg, overloaded)
     local interval = cfg.probe_interval or 0
-    if interval > 0 and m.window ~= nil and m.window % interval == 0
+    if not overloaded and interval > 0 and m.window ~= nil
+        and m.window % interval == 0
         and m.rejected_count > 0 and next_state.long_rtt ~= nil then
         next_state.probe_restore = next_state.limit
         next_state.limit = math.max(cfg.min_limit,

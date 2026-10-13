@@ -78,7 +78,7 @@ function _M.update(state, m, cfg)
         short_rtt = short_rtt,
         gradient = congested and 0 or 1,
         held = false,
-    }, m, cfg)
+    }, m, cfg, overloaded)
 end
 
 return _M

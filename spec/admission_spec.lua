@@ -192,38 +192,48 @@ describe("admission", function()
         assert.are.equal(1, limiter.anomalies.negative_inflight)
     end)
 
-    it("rebuilds an evicted inflight counter from held slots instead of zero", function()
-        -- ngx.shared may evict unexpired keys under memory pressure: two
-        -- slots held at limit 2, the counter vanishes, a third acquire
-        -- must not become a third held slot on a counter reading 1
-        local limiter, dict = fresh_env({ initial_limit = 2, max_limit = 2 })
-        assert.True(limiter:try_acquire())
-        assert.True(limiter:try_acquire())
-        dict._data["al:1:payments:inflight"] = nil
+    for _, mode in ipairs({ "fail_closed", "fail_open" }) do
+        it("never reconstructs sibling holdings after eviction under " .. mode,
+            function()
+                local a, dict = fresh_env({ initial_limit = 2, max_limit = 2,
+                    failure_mode = mode })
+                -- A second worker-local instance shares the same dictionary.
+                runtime.registry = {}
+                runtime.order = {}
+                local b = assert(adaptive.new({ name = "payments",
+                    shared_dict = "adaptive_limit", initial_limit = 2,
+                    max_limit = 2, failure_mode = mode }))
+                assert(adaptive.start())
+                assert.True(a:try_acquire())
+                assert.True(b:try_acquire())
+                dict:delete(a.K_inflight)
 
-        local ok, err = limiter:try_acquire()
-        assert.falsy(ok)
-        assert.are.equal(errors.INTERNAL_ERROR, err)
-        assert.are.equal(1, limiter.anomalies.inflight_missing)
-        assert.are.equal(1, limiter.internal_errors)
-        assert.are.equal(2, limiter._inflight)
-        assert.are.equal(2, dict._data["al:1:payments:inflight"])
-        -- the rebuilt counter enforces the cap again
-        local rok, rerr = limiter:try_acquire()
-        assert.falsy(rok)
-        assert.are.equal(errors.REJECTED, rerr)
-        assert.True(limiter:release(0.010))
-        assert.True(limiter:try_acquire())
-        assert.are.equal(2, dict._data["al:1:payments:inflight"])
-
-        -- eviction discovered by a release: rebuilt, then released
-        dict._data["al:1:payments:inflight"] = nil
-        assert.True(limiter:release(0.010))
-        assert.are.equal(1, dict._data["al:1:payments:inflight"])
-        assert.are.equal(1, limiter._inflight)
-        assert.are.equal(2, limiter.anomalies.inflight_missing)
-        assert.are.equal(1, limiter.internal_errors)
-    end)
+                for _ = 1, 2 do
+                    local ok, err = a:try_acquire()
+                    assert.is_nil(ok)
+                    assert.are.equal(errors.INTERNAL_ERROR, err)
+                    assert.is_nil(dict:get(a.K_inflight))
+                end
+                ngx.ctx = {}
+                local ok, err = a:access()
+                if mode == "fail_open" then
+                    assert.True(ok)
+                    assert.are.equal(3, ngx.ctx[a._ctx_key])
+                    assert.True(a:log())
+                else
+                    assert.is_nil(ok)
+                    assert.are.equal(errors.INTERNAL_ERROR, err)
+                end
+                for _, worker in ipairs({ a, b }) do
+                    local released, rerr = worker:release(0.010)
+                    assert.is_nil(released)
+                    assert.are.equal(errors.INTERNAL_ERROR, rerr)
+                    assert.are.equal(1, worker._inflight)
+                end
+                assert.is_nil(dict:get(a.K_inflight))
+                assert.are.equal(2, a._inflight + b._inflight)
+            end)
+    end
 
     it("surfaces a non-finite inflight counter as an internal error, never admits, never resets",
         function()

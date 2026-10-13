@@ -120,6 +120,9 @@ that later window — the same idea as Envoy's
 adaptive-concurrency minRTT recalculation and BBR's PROBE_RTT. Expect a
 short, periodic dip in the published limit under sustained saturation;
 `state().probe_restore` shows the limit it will return to.
+Restoration requires enough healthy, positive latency samples. Explicit
+overload during a probe cancels it and backs off from the reduced limit;
+idle or undersampled probe windows keep that reduced limit.
 
 Two planes, strictly separated:
 
@@ -307,7 +310,7 @@ Explicit options override `profile`; profiles are only pre-tuned bundles
 | `profile` | string | `"balanced"` | `conservative` sheds earlier/grows slower; `responsive` tolerates bursts, reacts fast |
 | `initial_limit` | integer | 50 | `[min_limit, max_limit]`; cold-start value |
 | `min_limit` / `max_limit` | integer | 1 / 2000 | `≥ 1`; hard clamps on every publication |
-| `sample_window` | number | 1.0 | seconds; controller window |
+| `sample_window` | number | 1.0 | seconds; controller window; changing it requires a full restart |
 | `aggregation_grace` | number | 0.35 | seconds; wait after window close before processing (late flushes) |
 | `min_samples` | integer | 20 | minimum usable latency samples for an RTT update |
 | `failure_mode` | string | `"fail_open"` | lifecycle behavior on limiter-internal failures |
@@ -355,10 +358,12 @@ raises `limit_missing` anomalies rather than admitting unbounded.
   a limit outside `[min_limit, max_limit]` (including `inf`) is treated
   the same way. An `inflight` counter that vanished under memory pressure
   (OpenResty may evict unexpired keys) is **not** recreated from zero —
-  that would forget every held slot: it is rebuilt from this worker's own
-  held count (`inflight_missing` anomaly; the discovering acquire fails as
-  an internal error under `failure_mode`), and sibling workers' earlier
-  admissions reconcile as they drain. A corrupted `inflight` counter (non-numeric or
+  that would forget every held slot. It stays absent and acquisitions and
+  releases return an internal error (`inflight_missing` anomaly), governed
+  by `failure_mode` for lifecycle admission. Quiesce traffic and fully
+  restart nginx to clear both lost shared state and pending worker-local
+  mirrors. A corrupted `inflight` counter
+  (non-numeric or
   non-finite — `-inf + 1` must never admit) is **not** auto-repaired: the
   library cannot know how many slots other workers hold, and an
   unsynchronized reset would erase their admissions. It is surfaced
@@ -367,9 +372,16 @@ raises `limit_missing` anomalies rather than admitting unbounded.
   key with traffic quiesced:
   `ngx.shared.<zone>:set("al:1:<name>:inflight", 0)`.
   The limiter never crashes a request comparing against garbage.
+* **Startup write failures**: schema, window-size metadata, counter
+  initialization, and adopted-limit writes are checked. `start()` returns
+  an error and admission remains disabled when one fails.
 * **Graceful reload (`nginx -s reload`)**: the shared dictionary
   survives; new workers validate the schema marker and adopt the learned
-  limit. Verified under continuous wrk load across repeated reloads
+  limit when `sample_window` matches the stored value. Changing it requires
+  a full stop/start so old and new workers cannot mix window IDs. Existing
+  state from 0.1.1 and earlier has no window-size marker; upgrading to this
+  development version also requires a full stop/start. The matching-window
+  reload behavior was verified under continuous wrk load across repeated reloads
   (`benchmark/resilience.sh`): no lockout, no reset, no drift.
 * **Worker exit (graceful)**: `adaptive.exit()` reconciles held slots.
   Late log phases are safe (the excess decrement is compensated, anomaly counted).
@@ -456,6 +468,7 @@ repetition's number, including noisy runs, is listed in
   protected resource is backend processing.
 * **Config changes** take effect on reload; the learned limit persists and
   is immediately clamped to a changed `min_limit`/`max_limit` range.
+  Changing `sample_window` requires a full stop/start.
 * **`lua_code_cache on` is required** (the default). With it off, every
   request runs in a fresh Lua VM that has no registry and never saw
   `start()`: `get()` raises and `try_acquire()` returns `not_started`.

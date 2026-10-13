@@ -7,6 +7,8 @@
 -- Key layout (prefix = "al:<schema>:<name>:"):
 --   limit, inflight, long_rtt, short_rtt, gradient, probe_restore,
 --   last_window, last_update   — permanent controller state
+--   sample_window             — immutable window size for reload validation
+--   controller_lease          — limiter-wide publication lease (TTL + cleanup)
 --   lc:<worker_id>             — that worker's newest completion time
 --   w:<n>:c|s|ovl|tmo|err|abt|rej|cmp — per-window aggregate accumulators;
 --       every writer uses atomic incr (init 0), so flushes from any
@@ -60,6 +62,8 @@ function _M.new(dict, name)
         probe_restore = prefix .. "probe_restore", -- set only mid-probe
         last_window = prefix .. "last_window",
         last_update = prefix .. "last_update",
+        sample_window = prefix .. "sample_window",
+        controller_lease = prefix .. "controller_lease",
     }
 
     local state = {
@@ -152,9 +156,19 @@ function _M:try_lease(n, owner, ttl)
     return self.dict:add(self.prefix .. "lease:" .. n, owner, ttl)
 end
 
--- True while some worker holds (or recently held) the lease on window n.
-function _M:lease_held(n)
-    return self.dict:get(self.prefix .. "lease:" .. n) ~= nil
+-- One limiter-wide lease serializes different windows as well as workers.
+function _M:try_controller_lease(owner, ttl)
+    return self.dict:add(self.K.controller_lease, owner, ttl)
+end
+
+function _M:controller_lease_owned(owner)
+    return self.dict:get(self.K.controller_lease) == owner
+end
+
+function _M:release_controller_lease(owner)
+    if self:controller_lease_owned(owner) then
+        self.dict:delete(self.K.controller_lease)
+    end
 end
 
 function _M:heartbeat(worker_id, now, ttl)

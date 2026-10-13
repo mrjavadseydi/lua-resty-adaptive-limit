@@ -124,7 +124,7 @@ function _M.update(state, m, cfg)
         short_rtt = short_rtt,
         gradient = gradient,
         held = false,
-    }, m, cfg)
+    }, m, cfg, overloaded)
 end
 
 return _M
