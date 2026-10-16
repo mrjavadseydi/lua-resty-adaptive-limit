@@ -205,6 +205,21 @@ describe("control_window measurement validation", function()
         assert.are.equal(0, limiter.internal_errors)
     end)
 
+    it("skips a window a sibling finished before our lease without an anomaly", function()
+        local limiter = fresh_limiter()
+        for _ = 1, 25 do
+            assert.True(limiter:try_acquire())
+            assert.True(limiter:release(0.010, "success"))
+        end
+        limiter:flush(1005)
+        assert.True(limiter:control_window(100, 1015))
+        -- a second worker that read last_window before the first published
+        assert.falsy(limiter:control_window(100, 1015))
+        assert.is_nil(limiter.anomalies.stale_controller_window)
+        assert.are.equal(1, limiter.controller_skips)
+        assert.is_nil(ngx.shared.adaptive_limit:get("al:1:pay:controller_lease"))
+    end)
+
     it("keeps the window when publication fails so it is retried", function()
         local limiter = fresh_limiter()
         local dict = ngx.shared.adaptive_limit

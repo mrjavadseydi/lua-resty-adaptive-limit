@@ -1070,6 +1070,13 @@ function _M:control_window(n, now)
         end
         return false
     end
+    -- A sibling that held the lease just before us may already have
+    -- published n: ordinary contention, skipped without an anomaly.
+    if (tonumber(st.dict:get(st.K.last_window)) or 0) >= n then
+        st:release_controller_lease(owner)
+        self.controller_skips = (self.controller_skips or 0) + 1
+        return false
+    end
     -- Clean up even if an algorithm throws; the scheduler reports the error.
     local ok, result = pcall(control_window, self, n, now, owner)
     st:release_controller_lease(owner)
