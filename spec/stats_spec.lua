@@ -90,6 +90,32 @@ describe("stats flush", function()
         assert.are.equal(1, limiter.stats.sample_count) -- monotonic source
     end)
 
+    it("creates window accumulators without evicting other keys", function()
+        -- incr with init and add/set make room by evicting LRU keys:
+        -- in a full zone that drops a limiter's inflight counter
+        local limiter = fresh_limiter()
+        assert.True(limiter:try_acquire())
+        assert.True(limiter:release(0.010, "success"))
+        local dict = limiter.st.dict
+        local incr, safe_add = dict.incr, dict.safe_add
+        dict.incr = function(d, k, delta, init, ...)
+            assert(init == nil, "incr with init can evict: " .. k)
+            return incr(d, k, delta, init, ...)
+        end
+        dict.safe_add = function(d, k, ...)
+            if k:find(":w:", 1, true) then return false, "no memory" end
+            return safe_add(d, k, ...)
+        end
+        limiter:flush(1005)
+        assert.are.equal(1, limiter.internal_errors)
+        assert.is_nil(dict._data[win_key(100, "c")])
+        assert.are.equal(0, dict._data["al:1:pay:inflight"])
+        dict.safe_add = safe_add
+        limiter:flush(1006)
+        dict.incr = incr
+        assert.are.equal(1, dict._data[win_key(100, "c")])
+    end)
+
     it("accounts aborted, rejected and error outcomes in their buckets", function()
         local limiter = fresh_limiter()
         assert.True(limiter:try_acquire())

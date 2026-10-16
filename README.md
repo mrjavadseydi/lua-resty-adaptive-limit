@@ -38,8 +38,9 @@ software; read the failure behavior and limitations before deploying it.
 
 ## Installation
 
-OpenResty ≥ **1.15.8.1** (the library uses `exit_worker_by_lua*`,
-available since lua-nginx-module 0.10.15). No other runtime dependencies
+OpenResty ≥ **1.19.3.1** (the library uses `exit_worker_by_lua*`,
+available since lua-nginx-module 0.10.18; 1.15.8.x and 1.17.8.x reject the
+directive). No other runtime dependencies
 (lua-resty-core, which OpenResty bundles, is loaded automatically).
 
 ```bash
@@ -340,9 +341,15 @@ Per limiter: ~10 permanent keys + up to ~3 live windows × 9 accumulator
 keys (TTL-bounded) + one heartbeat key per worker. All entries are small
 numbers/short strings; a limiter idles well under 2 KB. A 10m zone serves
 dozens of limiters comfortably. `state().shared_dict_free` exposes usage —
-alert on it. Critical keys are never written with TTLs; if the zone is
-evicted/undersized the limiter re-seeds from the last observed value and
-raises `limit_missing` anomalies rather than admitting unbounded.
+alert on it. Critical keys are never written with TTLs, and the library
+never evicts to make room: every write it makes is non-evicting, so a
+full zone fails the write that needed space instead of dropping a
+limiter's `inflight` counter. `start()` then fails with a "lua_shared_dict
+... is full; increase its size" error, and at runtime window flushes fail
+(rate-limited error log, `internal_errors`) while admission keeps
+enforcing the current limit. Keys removed from outside the library (an
+operator `flush_all`, another module writing into a shared zone) follow
+**Failure behavior** below.
 
 ## Failure behavior
 

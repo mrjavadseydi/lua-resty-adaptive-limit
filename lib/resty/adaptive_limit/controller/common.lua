@@ -20,6 +20,15 @@ local math_ceil = math.ceil
 -- baseline rather than learn a still-queued RTT.
 local PROBE_OFFSET_CAP = 4
 
+-- Relative RTT difference still read as "the same latency" (measurement
+-- noise around a steady value). Service time does not change when
+-- concurrency is cut, so this does not scale with probe_fraction.
+local PROBE_RTT_TOLERANCE = 0.25
+
+local function same_rtt(a, b)
+    return math.abs(a / b - 1) <= PROBE_RTT_TOLERANCE
+end
+
 function _M.is_finite(v)
     -- NaN fails the first check (NaN ~= NaN); +-inf fail the others.
     return v == v and v < math_huge and v > -math_huge
@@ -189,6 +198,26 @@ local function hold_probe(state, restore)
     }
 end
 
+-- The baseline a clean probe window teaches. A probe may always lower
+-- it. Raising it needs evidence that the probe measured service time,
+-- which does not change when concurrency is cut: the probe RTT must be
+-- the same latency as the pre-probe RTT (probes start only when that is
+-- steady, see probe_start). A saturated backend serves at a fixed rate,
+-- so a probe still above capacity reads about probe_fraction x the
+-- pre-probe RTT (Little's law) and fails low; a capacity drop during the
+-- probe makes it read higher than before the cut and fails high.
+-- Learning either queued RTT makes the gradient read 1 and the headroom
+-- ratchet the limit up. Refusing a genuine raise only shrinks the limit
+-- until a later probe, measured entirely in the new regime, passes.
+local function probe_baseline(state, mean)
+    local prior = _M.usable_rtt(state.long_rtt) and state.long_rtt or nil
+    local pre = _M.usable_rtt(state.short_rtt) and state.short_rtt or nil
+    if prior == nil or pre == nil or mean <= prior or same_rtt(mean, pre) then
+        return mean
+    end
+    return prior
+end
+
 local function restore_probe(state, restore, long_rtt)
     return {
         limit = restore,
@@ -248,7 +277,7 @@ function _M.probe_step(state, m, cfg, overloaded)
     if m.sample_count >= cfg.min_samples and not overloaded
         and _M.usable_rtt(mean)
         and probe_drained(mean, cfg.sample_window, offset) then
-        return restore_probe(state, restore, mean)
+        return restore_probe(state, restore, probe_baseline(state, mean))
     end
     -- Undrained, too few samples, or a weak overload: keep the reduced
     -- limit so a later window can be the clean sample. Give up at the
@@ -259,11 +288,17 @@ function _M.probe_step(state, m, cfg, overloaded)
     return restore_probe(state, restore, long_rtt)
 end
 
+-- A probe starts only while latency is steady: its pre-probe reference
+-- is the smoothed short_rtt, which lags a sudden change (load onset, a
+-- capacity drop) and would let a queued probe pass as service time. A
+-- moving window skips this probe; the next interval tries again.
 function _M.probe_start(next_state, m, cfg, overloaded)
     local interval = cfg.probe_interval or 0
     if not overloaded and interval > 0 and m.window ~= nil
         and m.window % interval == 0
-        and m.rejected_count > 0 and next_state.long_rtt ~= nil then
+        and m.rejected_count > 0 and next_state.long_rtt ~= nil
+        and _M.usable_rtt(m.mean_rtt) and _M.usable_rtt(next_state.short_rtt)
+        and same_rtt(m.mean_rtt, next_state.short_rtt) then
         next_state.probe_restore = next_state.limit
         next_state.limit = math.max(cfg.min_limit,
             next_state.limit * cfg.probe_fraction)

@@ -7,6 +7,24 @@ All notable changes are documented here. Format based on
 ## [Unreleased]
 
 ### Fixed
+- Baseline probes no longer adopt a still-queued RTT. When the probe
+  limit was itself above capacity, the probe re-seeded `long_rtt` with
+  queueing latency; the gradient then read 1 and headroom ratcheted the
+  limit far above capacity (32x in simulation J, limit above offered
+  load in real-traffic tests). A probe still lowers the baseline freely
+  and raises it only when its RTT stayed within 25% of the pre-probe RTT:
+  a probe still above capacity reads lower (Little's law), one that
+  straddles a capacity drop reads higher; neither is service time. Probes
+  start only while latency is steady, so that reference does not lag a
+  sudden change.
+- The library never evicts keys from its zone. Window accumulators were
+  created with evicting writes, so an undersized zone dropped limiters'
+  `inflight` counters (uncapped admission under `fail_open`) and
+  `sample_window` markers (a fresh worker start refused as legacy state).
+  A full zone now fails startup with an explicit "increase its size"
+  error, and runtime flush failures say the same.
+- Startup contention between workers no longer counts a
+  `stale_controller_window` anomaly.
 - Missing inflight counters remain errors until safely reset; recovery
   no longer forgets sibling workers' holdings and exceeds the cap.
 - A limiter-wide controller lease orders publications across windows,
@@ -19,6 +37,9 @@ All notable changes are documented here. Format based on
   failures; concurrent initialization preserves already published state.
 
 ### Upgrade notes
+- The minimum supported OpenResty is 1.19.3.1 (lua-nginx-module 0.10.18).
+  Earlier releases documented 1.15.8.1, but `exit_worker_by_lua*`, which
+  the setup requires, does not exist before 0.10.18.
 - Changing `sample_window` requires a full stop/start. Upgrading from
   0.1.1 or earlier also requires a full stop/start because existing shared
   state has no window-size metadata. Matching-window reloads preserve the

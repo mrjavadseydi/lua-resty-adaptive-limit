@@ -229,15 +229,15 @@ describe("control_window measurement validation", function()
         end
         limiter:flush(1005)
 
-        local set = dict.set
-        dict.set = function(d, key, ...)
+        local set = dict.safe_set
+        dict.safe_set = function(d, key, ...)
             if key == "al:1:pay:limit" then
                 return nil, "no memory"
             end
             return set(d, key, ...)
         end
         assert.falsy(limiter:control_window(100, 1015))
-        dict.set = set
+        dict.safe_set = set
         assert.are.equal(1, limiter.internal_errors)
         -- a failed publication is not an update
         assert.are.equal(0, limiter.controller_updates or 0)

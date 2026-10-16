@@ -262,7 +262,7 @@ function _M:reseed_shared_state()
         { self.K_limit, floor(limit) },
     }
     for i = 1, #seeds do
-        local ok, err = st.dict:add(seeds[i][1], seeds[i][2])
+        local ok, err = st.dict:safe_add(seeds[i][1], seeds[i][2])
         if not ok and err ~= "exists" then
             return nil, err or errors.INTERNAL_ERROR
         end
@@ -324,7 +324,7 @@ function _M:check_schema()
             return nil, errors.INVALID_STATE,
                 "shared state has no sample_window metadata; a full restart is required"
         end
-        local ok, aerr = dict:add(st.K.sample_window, self.cfg.sample_window)
+        local ok, aerr = dict:safe_add(st.K.sample_window, self.cfg.sample_window)
         if not ok and aerr ~= "exists" then
             return nil, errors.INTERNAL_ERROR, aerr
         end
@@ -374,8 +374,8 @@ function _M:adopt_shared_state()
         -- reload): publish the clamp immediately so admission is bounded
         -- from the first request, not just from the next controller
         -- window.
-        local ok, werr = st.dict:set(self.K_limit, floor(clamped))
-        if ok then ok, werr = st.dict:set(st.K.limit_f, clamped) end
+        local ok, werr = st.dict:safe_set(self.K_limit, floor(clamped))
+        if ok then ok, werr = st.dict:safe_set(st.K.limit_f, clamped) end
         if not ok then return nil, werr or errors.INTERNAL_ERROR end
     end
     self._last_limit = clamped
@@ -407,7 +407,7 @@ function _M:try_acquire()
         -- unbounded.
         count_anomaly(self, "limit_missing")
         limit = self._last_limit or self.cfg.initial_limit
-        dict:set(self.K_limit, limit)
+        dict:safe_set(self.K_limit, limit)
         rate_limited_log(self, "limit_missing", ngx_WARN,
             "limit key missing; re-seeded from last observed value")
     elseif type(limit) ~= "number" or limit ~= limit
@@ -420,7 +420,7 @@ function _M:try_acquire()
         -- and surface.
         count_anomaly(self, "limit_corrupted")
         limit = self._last_limit or self.cfg.initial_limit
-        dict:set(self.K_limit, limit)
+        dict:safe_set(self.K_limit, limit)
         rate_limited_log(self, "limit_corrupted", ngx_ERR,
             "limit key corrupted (non-numeric or outside ",
             "[min_limit, max_limit]); re-seeded")
@@ -639,7 +639,8 @@ function _M:flush(now)
                 -- the next tick; surface the dict failure
                 self.internal_errors = self.internal_errors + 1
                 rate_limited_log(self, "flush", ngx_ERR,
-                    "window flush failed: ", err or "unknown")
+                    "window flush failed: ", err or "unknown",
+                    err == "no memory" and " (shared dict full; increase its size)" or "")
                 self._flush_pending = win
                 return win
             end

@@ -355,9 +355,25 @@ Given window measurement `m` and current state:
    have drained one RTT of pre-probe admissions
    (`offset >= ceil(mean_rtt / sample_window) + 1`); until then the reduced
    limit is held for up to three windows after the cut, then restored
-   **without** learning a still-queued RTT, provided it has sufficient
-   healthy, positive latency samples. Undersampled probe windows keep
-   holding. An overloaded probe cancels restoration and takes normal
+   **without** learning a still-queued RTT. Undersampled or weakly
+   overloaded probe windows hold under the same cap. The clean window may
+   always lower `long_rtt`; it may raise it only if its RTT stayed within
+   25% of the pre-probe `short_rtt`, either way: service time does not
+   change when concurrency is cut. That reference is trustworthy only when
+   latency was steady, since `short_rtt` lags a sudden change (load onset,
+   a capacity drop), so a probe starts only on a window whose RTT is within
+   the same 25% of `short_rtt`; a moving window skips to the next interval. A saturated
+   backend serves at a fixed rate, so its latency scales with concurrency
+   (Little's law) and a probe still above capacity reads about
+   `probe_fraction` x the pre-probe RTT (fails low); a capacity drop during
+   the probe reads above the pre-probe RTT (fails high). Without this gate
+   either queued RTT became the baseline, the gradient read 1 and headroom
+   ratcheted the limit up (simulation J: 32x capacity). Refusing a genuine
+   raise only shrinks the limit until a later probe, measured entirely in
+   the new regime, passes (simulation H). Known limit: a cold start into an
+   already saturated backend still seeds `long_rtt` from a queued first
+   window, and a probe can lower it only once `limit * probe_fraction`
+   falls below capacity. An overloaded probe cancels restoration and takes normal
    overload handling at the reduced limit; overloaded windows never start
    a new probe.
    Phases derive from the shared window number, so any worker can run any
@@ -443,9 +459,12 @@ operations, executed by at most one worker, once per `sample_window`.
   - no automatic reset ever runs (an unsynchronized "repair" while live
     requests modify the counter would corrupt it). The README documents the
     operator procedure: quiesce (or accept the shedding), then reset
-    `inflight` from an admin snippet. An *evicted* `inflight` key (the
-    dictionary may drop unexpired entries under memory pressure) is lost
-    distributed state: `incr` runs without an init value, a `not found`
+    `inflight` from an admin snippet. A *lost* `inflight` key is lost
+    distributed state. The library itself never causes the loss: all its
+    writes are non-evicting (`safe_add`/`safe_set`, `incr` without init),
+    so a full zone fails the write that needed room rather than dropping a
+    permanent key; only an outside `flush_all` or a foreign writer in a
+    shared zone removes it. Then `incr` runs without an init value, a `not found`
     is counted (`inflight_missing`), and both acquisition and release fail
     as internal errors without recreating the key. One worker's mirror
     cannot account for sibling holdings. Recovery after counter loss is

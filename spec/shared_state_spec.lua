@@ -27,17 +27,18 @@ describe("shared-state startup", function()
         it("refuses a failed " .. field .. " write and can retry", function()
             local l, dict = new_worker()
             local key = field == "schema" and "adaptive_limit:schema" or l.st.K[field]
-            local add = dict.add
-            dict.add = function(d, k, ...)
+            local add = dict.safe_add
+            dict.safe_add = function(d, k, ...)
                 if k == key then return false, "no memory" end
                 return add(d, k, ...)
             end
             local ok, err = adaptive.start()
             assert.is_nil(ok)
             assert.match("no memory", err, 1, true)
+            assert.match('lua_shared_dict "adaptive_limit" is full; increase its size', err, 1, true)
             assert.False(runtime.started)
             assert.are.equal(0, ngx._timer_calls)
-            dict.add = add
+            dict.safe_add = add
             assert.True(adaptive.start())
             assert.are.equal(100, dict:get(l.K_limit))
             assert.are.equal(0, dict:get(l.K_inflight))
@@ -50,8 +51,8 @@ describe("shared-state startup", function()
             assert(adaptive.start())
             dict:set(old.st.K.last_window, 999)
             local l = new_worker({ initial_limit = 5, max_limit = 10 }, dict)
-            local set = dict.set
-            dict.set = function(d, k, ...)
+            local set = dict.safe_set
+            dict.safe_set = function(d, k, ...)
                 if k == l.st.K[field] then return false, "no memory" end
                 return set(d, k, ...)
             end
@@ -60,7 +61,7 @@ describe("shared-state startup", function()
             assert.match("no memory", err, 1, true)
             assert.False(runtime.started)
             assert.are.equal(999, dict:get(l.st.K.last_window))
-            dict.set = set
+            dict.safe_set = set
             assert(adaptive.start())
             assert.are.equal(10, dict:get(l.K_limit))
             assert.are.equal(10, dict:get(l.st.K.limit_f))
@@ -86,9 +87,9 @@ describe("shared-state startup", function()
 
     it("preserves sibling publications while finishing concurrent initialization", function()
         local a, dict = new_worker()
-        local add = dict.add
+        local add = dict.safe_add
         local injected = false
-        dict.add = function(d, key, ...)
+        dict.safe_add = function(d, key, ...)
             if key == a.K_limit and not injected then
                 injected = true
                 local b = new_worker(nil, dict)

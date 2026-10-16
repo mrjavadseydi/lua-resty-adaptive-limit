@@ -20,12 +20,19 @@
 --
 -- All methods return library-level results; raw dict error strings are
 -- propagated to the caller (limiter.lua classifies them).
+--
+-- Every write is non-evicting (safe_add / safe_set, incr without init).
+-- The plain variants make room by evicting least-recently-used keys, and
+-- in this zone those are permanent ones: a window accumulator created in
+-- a full zone would drop a limiter's inflight counter (admission then
+-- runs uncapped under fail_open) or its sample_window marker (the next
+-- worker start is refused as legacy state). A full zone must fail the
+-- write that needs the room, loudly, instead.
 
 -- expire() lives in lua-resty-core, not on the C shared-dict metatable.
--- OpenResty after ngx_lua 0.10.15 loads that module by default; older
--- builds and `lua_load_resty_core off` do not. Loading it here makes
--- window TTLs work on the documented minimum version. Missing is fine
--- (plain Lua unit tests); start() refuses a dict that still has no expire.
+-- Every supported OpenResty (>= 1.19.3.1) loads it already; the explicit
+-- require keeps that true for embedders. Missing is fine (plain Lua unit
+-- tests); start() refuses a dict that still has no expire.
 pcall(require, "resty.core")
 
 local WINDOW_FIELDS = { "c", "s", "ovl", "tmo", "cer", "err", "abt", "rej",
@@ -106,9 +113,17 @@ function _M:add_window(n, field, delta, window_ttl)
     end
     local keys = self:window_keys(n)
     local key = keys[field]
-    -- init TTL covers the gap before expire(). incr keeps an existing
-    -- key's TTL unchanged, so expire() refreshes it on every write.
-    local value, err = dict:incr(key, delta, 0, window_ttl)
+    -- First write of the window creates the key with safe_add (its TTL
+    -- covers the gap before expire()); incr with init would evict. incr
+    -- keeps an existing key's TTL, so expire() refreshes it every write.
+    local value, err = dict:incr(key, delta)
+    if err == "not found" then
+        local ok, aerr = dict:safe_add(key, 0, window_ttl)
+        if not ok and aerr ~= "exists" then
+            return nil, aerr
+        end
+        value, err = dict:incr(key, delta)
+    end
     if not value then
         return nil, err
     end
@@ -149,7 +164,7 @@ end
 
 -- One limiter-wide lease serializes different windows as well as workers.
 function _M:try_controller_lease(owner, ttl)
-    return self.dict:add(self.K.controller_lease, owner, ttl)
+    return self.dict:safe_add(self.K.controller_lease, owner, ttl)
 end
 
 function _M:controller_lease_owned(owner)
@@ -163,7 +178,7 @@ function _M:release_controller_lease(owner)
 end
 
 function _M:heartbeat(worker_id, now, ttl)
-    return self.dict:set(self.prefix .. "hb:" .. worker_id, now, ttl)
+    return self.dict:safe_set(self.prefix .. "hb:" .. worker_id, now, ttl)
 end
 
 function _M:worker_alive(worker_id, now)
@@ -176,8 +191,8 @@ function _M:read_schema()
 end
 
 function _M:write_schema()
-    -- no TTL; add() so a concurrent first-worker race is benign
-    return self.dict:add(self.SCHEMA_KEY, tostring(self.SCHEMA_VERSION))
+    -- no TTL; add so a concurrent first-worker race is benign
+    return self.dict:safe_add(self.SCHEMA_KEY, tostring(self.SCHEMA_VERSION))
 end
 
 -- Controller state read/write (control path only). Missing keys come
@@ -219,11 +234,11 @@ function _M:publish_controller_state(limit_f, long_rtt, short_rtt, gradient,
         if value == nil then
             return dict:delete(key)
         end
-        return dict:set(key, value)
+        return dict:safe_set(key, value)
     end
     if gradient ~= nil then
         -- diagnostics only; kept across held windows (which carry none)
-        dict:set(K.gradient, gradient)
+        dict:safe_set(K.gradient, gradient)
     end
     local ok, err = put(K.limit_f, limit_f)
     if ok then ok, err = put(K.limit, math.floor(limit_f)) end
@@ -242,7 +257,7 @@ end
 -- completion is still a completion). One key per worker, so no
 -- cross-worker read-modify-write exists; state() takes the max.
 function _M:publish_last_completion(worker_id, t)
-    return self.dict:set(self.prefix .. "lc:" .. worker_id, t)
+    return self.dict:safe_set(self.prefix .. "lc:" .. worker_id, t)
 end
 
 function _M:worker_last_completion(worker_id)

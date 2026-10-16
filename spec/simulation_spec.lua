@@ -61,6 +61,7 @@ function sim.new(opts)
     self.float_limit = opts.initial_limit
     self.demand = opts.demand
     self.no_timeouts = opts.no_timeouts
+    self.curve = opts.curve
     self.window = 0
     self.long_rtt = nil
     self.short_rtt = nil
@@ -69,6 +70,11 @@ function sim.new(opts)
 end
 
 function sim:rtt(a)
+    if self.curve == "little" then
+        -- saturated server at fixed throughput: latency = concurrency /
+        -- throughput (Little's law), so halving concurrency halves RTT
+        return self.base * math.max(1, a / self.capacity)
+    end
     local over = math.max(0, a - self.capacity) / self.capacity
     return self.base * (1 + 8 * over)
 end
@@ -331,6 +337,50 @@ describe("simulation I: sustained congestion without failures", function()
         end
         assert.True(s.eff >= 80, "collapsed to " .. s.eff)
     end)
+end)
+
+describe("simulation J: capacity drop just before a baseline probe", function()
+    -- Little's-law backend, no failures. Capacity falls 100 -> 10 two
+    -- windows before the window-30 probe, so the probe cuts to half a
+    -- limit that is still ~5x capacity: its window reads a queued RTT of
+    -- ~probe_fraction x the pre-probe RTT. Learning that as the baseline
+    -- made the gradient read 1 and the headroom ratchet the limit to 32x
+    -- capacity, permanently.
+    for _, alg in ipairs({ g2, aimd }) do
+        it(alg.name .. " never adopts a still-queued probe as the baseline", function()
+            local s = sim.new({ algorithm = alg, capacity = 100, demand = 1000,
+                initial_limit = 50, no_timeouts = true, curve = "little",
+                seed = 121 })
+            s:run(27)
+            s.capacity = 10
+            s:run(300)
+            for i = #s.history - 59, #s.history do
+                assert.True(s.history[i] <= 30,
+                    "window " .. i .. " limit " .. s.history[i] .. " at capacity 10")
+            end
+            assert.True(s.long_rtt < s.base * 1.2,
+                "baseline learned the queue: " .. s.long_rtt)
+            assert.True(s.eff >= 8, "collapsed to " .. s.eff)
+        end)
+
+        it(alg.name .. " ignores a probe that straddles a capacity drop", function()
+            -- healthy seed below capacity, saturated by window 30 when the
+            -- probe starts; capacity falls 80 -> 10 inside the probe, so the
+            -- probe window reads more queueing than the pre-probe RTT
+            local s = sim.new({ algorithm = alg, capacity = 80, demand = 1000,
+                initial_limit = 40, no_timeouts = true, curve = "little",
+                seed = 131 })
+            s:run(30)
+            s.capacity = 10
+            s:run(300)
+            for i = #s.history - 59, #s.history do
+                assert.True(s.history[i] <= 30,
+                    "window " .. i .. " limit " .. s.history[i] .. " at capacity 10")
+            end
+            assert.True(s.long_rtt < s.base * 1.2,
+                "baseline learned the queue: " .. s.long_rtt)
+        end)
+    end
 end)
 
 describe("simulation: AIMD comparison on scenario B", function()

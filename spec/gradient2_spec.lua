@@ -117,14 +117,30 @@ describe("gradient2", function()
         assert.True(near(s3.limit, 50.22727272727273))
         assert.True(near(s3.long_rtt, 0.020))
         assert.True(near(s3.short_rtt, 0.044))
-        -- window 32 ran entirely at the probe limit: it re-seeds the
-        -- baseline (up or down) and restores the limit
+        -- window 32 ran entirely at the probe limit and restores it.
+        -- 0.025 fell with the cut almost as far as a still-queued probe
+        -- would (Little's law: 0.5 x 0.044 = 0.022): no evidence of a
+        -- slower backend, so the baseline is not raised
         m.window = 32
         m.mean_rtt = 0.025
         local s4 = assert(common.safe_update(g2, state_of(s3), m, cfg))
         assert.is_nil(s4.probe_restore)
         assert.True(near(s4.limit, 100.45454545454545))
-        assert.True(near(s4.long_rtt, 0.025))
+        assert.True(near(s4.long_rtt, 0.020))
+        -- latency that did not fall with concurrency is service time
+        m.mean_rtt = 0.040
+        local up = assert(common.safe_update(g2, state_of(s3), m, cfg))
+        assert.True(near(up.long_rtt, 0.040))
+        -- a probe slower than before the cut is a capacity change during
+        -- the probe (queueing), not service time: not learned either
+        m.mean_rtt = 0.080
+        local high = assert(common.safe_update(g2, state_of(s3), m, cfg))
+        assert.True(near(high.long_rtt, 0.020))
+        -- a lower probe is always learned
+        m.mean_rtt = 0.015
+        local down = assert(common.safe_update(g2, state_of(s3), m, cfg))
+        assert.True(near(down.long_rtt, 0.015))
+        m.mean_rtt = 0.025
         -- app-limited windows never probe: the baseline learns directly
         m.window = 60
         m.rejected_count = 0
@@ -253,6 +269,41 @@ describe("gradient2", function()
         assert.are.equal(100, next_state.limit) -- no rejections, no headroom
     end)
 
+    it("starts a probe only while latency is steady", function()
+        local cfg = base_cfg()
+        cfg.probe_interval = 30
+        cfg.probe_fraction = 0.5
+        -- saturation just began: the window reads 0.100 while short_rtt
+        -- is still 0.020, so short' = 0.060 lags the real latency and
+        -- would be a wrong pre-probe reference; this probe is skipped
+        local state = { limit = 100, long_rtt = 0.020, short_rtt = 0.020 }
+        local m = healthy_window(1000, 0.100)
+        m.window = 30
+        assert.is_nil(assert(common.safe_update(g2, state, m, cfg)).probe_restore)
+        -- the same window once latency has settled starts it
+        state.short_rtt = 0.100
+        assert.True(assert(common.safe_update(g2, state, m, cfg)).probe_restore ~= nil)
+    end)
+
+    it("raises the baseline from a probe only within a fixed tolerance", function()
+        -- probe_fraction 0.1: a probe reading 0.575 x the pre-probe RTT
+        -- fell with the cut (it is not service time) even though it is
+        -- above the Little's-law midpoint (1 + 0.1) / 2 = 0.55
+        local cfg = base_cfg()
+        cfg.probe_interval = 30
+        cfg.probe_fraction = 0.1
+        local probe = { limit = 2.6, long_rtt = 0.010, short_rtt = 0.0247,
+            probe_restore = 26 }
+        local m = healthy_window(1000, 0.0142)
+        m.window = 32
+        local ns = assert(common.safe_update(g2, probe, m, cfg))
+        assert.is_nil(ns.probe_restore)
+        assert.True(near(ns.long_rtt, 0.010))
+        -- within 25% of the reference it is service time and is learned
+        m.mean_rtt = 0.0210
+        assert.True(near(assert(common.safe_update(g2, probe, m, cfg)).long_rtt, 0.0210))
+    end)
+
     it("does not reseed a probe window that has not drained", function()
         local cfg = base_cfg()
         cfg.probe_interval = 30
@@ -274,10 +325,10 @@ describe("gradient2", function()
         assert.True(near(held.probe_restore, started.probe_restore))
         -- offset 3 has had ceil(1.5)+1 windows: the sample is clean
         m.window = 33
-        m.mean_rtt = 0.030
+        m.mean_rtt = 0.040
         local learned = assert(common.safe_update(g2, state_of(held), m, cfg))
         assert.is_nil(learned.probe_restore)
-        assert.True(near(learned.long_rtt, 0.030))
+        assert.True(near(learned.long_rtt, 0.040))
         assert.True(near(learned.limit, started.probe_restore))
     end)
 

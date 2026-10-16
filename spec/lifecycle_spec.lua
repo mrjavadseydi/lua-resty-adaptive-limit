@@ -130,7 +130,7 @@ describe("access/log lifecycle", function()
         limiter.st.dict = {
             get = function() return nil end,
             incr = function() return nil, "no memory" end,
-            set = function() return true end,
+            safe_set = function() return true end,
         }
         assert.True(limiter:access()) -- fail_open: request proceeds
         assert.are.equal(3, ngx.ctx[limiter._ctx_key])
@@ -146,7 +146,7 @@ describe("access/log lifecycle", function()
         limiter.st.dict = {
             get = function() return nil end,
             incr = function() return nil, "no memory" end,
-            set = function() return true end,
+            safe_set = function() return true end,
         }
         local ok, err = limiter:access()
         assert.falsy(ok)

@@ -127,6 +127,16 @@ local function make_dict()
         return true
     end
 
+    -- the mock never runs out of memory, so the non-evicting variants
+    -- behave like the plain ones (tests patch them to inject failures)
+    function dict:safe_set(key, value, exptime)
+        return self:set(key, value, exptime)
+    end
+
+    function dict:safe_add(key, value, exptime)
+        return self:add(key, value, exptime)
+    end
+
     function dict:expire(key, ttl)
         return data[key] ~= nil
     end

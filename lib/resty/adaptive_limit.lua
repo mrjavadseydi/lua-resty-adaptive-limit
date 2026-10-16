@@ -23,6 +23,17 @@ local runtime = require("resty.adaptive_limit.runtime")
 
 local ngx_get_phase = ngx.get_phase
 
+-- Library writes never evict (state.lua), so a full zone surfaces as
+-- "no memory": name the fix instead of leaving a bare dict error.
+local function explain(limiter, msg)
+    msg = tostring(msg)
+    if msg:find("no memory", 1, true) then
+        return msg .. " (lua_shared_dict \"" .. limiter.cfg.shared_dict
+            .. "\" is full; increase its size)"
+    end
+    return msg
+end
+
 local _M = {
     _VERSION = "0.1.1",
     errors = errors,
@@ -77,13 +88,13 @@ function _M.start(opts)
                     tostring(state_mod.SCHEMA_VERSION) .. ")")
             end
             return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
-                "\": schema check failed: " .. tostring(detail or err)
+                "\": schema check failed: " .. explain(limiter, detail or err)
         end
         local adopted, aerr = limiter:adopt_shared_state()
         if not adopted and aerr then
             runtime.started = false
             return nil, "adaptive_limit: limiter \"" .. limiter.cfg.name ..
-                "\": adopt shared state failed: " .. tostring(aerr)
+                "\": adopt shared state failed: " .. explain(limiter, aerr)
         end
         -- Window accumulators get their TTL from dict:expire, which
         -- lua-resty-core installs. Without it every flush throws, the
