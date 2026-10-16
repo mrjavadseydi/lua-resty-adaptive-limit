@@ -224,12 +224,12 @@ function _M.probe_step(state, m, cfg, overloaded)
     if restore == nil or interval <= 0 or m.window == nil then
         return nil
     end
-    -- Explicit failures take the normal backoff path at the reduced limit.
-    if overloaded then
+    -- Strong overload takes the normal backoff path at the reduced limit.
+    -- A weak one (too few completions to back off) must not: the normal
+    -- path would hold without probe_restore and strand the reduced limit.
+    if overloaded and (m.completions or m.sample_count)
+        >= cfg.overload_min_samples then
         return nil
-    end
-    if m.sample_count < cfg.min_samples or not _M.usable_rtt(m.mean_rtt) then
-        return hold_probe(state, restore)
     end
     local offset = m.window % interval
     -- The publish lands in the next window; that window is polluted by
@@ -245,17 +245,15 @@ function _M.probe_step(state, m, cfg, overloaded)
     end
 
     local mean = m.mean_rtt
-    local learn = m.sample_count >= cfg.min_samples and not overloaded
+    if m.sample_count >= cfg.min_samples and not overloaded
         and _M.usable_rtt(mean)
-        and probe_drained(mean, cfg.sample_window, offset)
-    if learn then
+        and probe_drained(mean, cfg.sample_window, offset) then
         return restore_probe(state, restore, mean)
     end
-    -- RTT still longer than the windows since the cut: keep the reduced
+    -- Undrained, too few samples, or a weak overload: keep the reduced
     -- limit so a later window can be the clean sample. Give up at the
     -- cap and restore the previous baseline unchanged.
-    if m.sample_count >= cfg.min_samples and not overloaded
-        and _M.usable_rtt(mean) and offset < PROBE_OFFSET_CAP then
+    if offset < PROBE_OFFSET_CAP then
         return hold_probe(state, restore)
     end
     return restore_probe(state, restore, long_rtt)

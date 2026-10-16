@@ -52,7 +52,6 @@ function _M.start(opts)
     end
 
     opts = opts or {}
-    runtime.started = false
     if opts.flush_interval ~= nil then
         if type(opts.flush_interval) ~= "number"
             or opts.flush_interval ~= opts.flush_interval

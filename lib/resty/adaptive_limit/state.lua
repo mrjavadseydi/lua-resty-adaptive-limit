@@ -16,7 +16,6 @@
 --       exptime (set once per window per worker, on rollover) so an
 --       interrupted controller cannot leak window keys; the controller
 --       additionally deletes them after processing.
---   lease:<n>                  — controller lease for window n (TTL only)
 --   hb:<worker_id>             — worker heartbeat (TTL only)
 --
 -- All methods return library-level results; raw dict error strings are
@@ -146,14 +145,6 @@ function _M:delete_window(n)
     for i = 1, #WINDOW_FIELDS do
         self.dict:delete(keys[WINDOW_FIELDS[i]])
     end
-end
-
--- Controller lease: add wins; TTL-only expiry (the lease is never
--- explicitly deleted — a successor lease for window n+1 must never be
--- disturbed by our cleanup, and window n is never processed again
--- anyway thanks to the last_window guard).
-function _M:try_lease(n, owner, ttl)
-    return self.dict:add(self.prefix .. "lease:" .. n, owner, ttl)
 end
 
 -- One limiter-wide lease serializes different windows as well as workers.

@@ -184,7 +184,7 @@ incompatible shared state is a loud startup error.
 | `...:last_update` | number | controller | permanent |
 | `...:w:<n>:c` / `:s` | number | worker flush (atomic incr) | exptime + explicit delete |
 | `...:w:<n>:ovl` / `:tmo` / `:cer` / `:err` / `:abt` / `:rej` / `:cmp` | number | worker flush (atomic incr) | exptime + explicit delete |
-| `...:lease:<n>` | string `"<pid>:<seq>"` | lease contender (add) | TTL (`lease_ttl`) |
+| `...:controller_lease` | string `"<pid>:<n>:<seq>"` | lease contender (add) | TTL 5s + owner release |
 | `...:hb:<worker_id>` | number (timestamp) | scheduler heartbeat | TTL 5s |
 | `...:lc:<worker_id>` | number (timestamp) | scheduler tick (newest completion) | permanent |
 
@@ -510,12 +510,12 @@ self-heal immediately as old workers finish draining.
   per worker, shared by all limiters (registered automatically by `new()`).
   The callback body is fully pcall-wrapped: the timer cannot die from a
   limiter error; per-tick errors are counted and logged rate-limited.
-- Controller leadership per window: `dict:add(lease:<n>, "<pid>:<seq>",
-  lease_ttl)`. The winner runs window `n`'s update; losers do nothing.
-  Leases are keyed per window and **never released explicitly** (TTL
-  expiry only) — the successor's lease for window `n+1` can therefore never
-  be disturbed. `last_window` makes the update idempotent: if leadership
-  changes mid-window, the new holder sees `last_window >= n` and skips.
+- Controller leadership: one limiter-wide `dict:add(controller_lease,
+  "<pid>:<n>:<seq>", 5s)` per window update. The winner runs window `n`'s
+  update and releases the lease when done; losers do nothing. The TTL only
+  recovers leadership after worker death. Before publishing, the holder
+  re-reads `last_window` (skips if `>= n`) and re-checks it still owns the
+  lease, so a stalled worker whose lease expired abandons its update.
 - No `resty.lock`, no network, no yielding anywhere in the scheduler.
 
 ## 12. Scope and documented limitations

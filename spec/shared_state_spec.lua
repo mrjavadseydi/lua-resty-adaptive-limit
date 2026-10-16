@@ -137,6 +137,28 @@ describe("shared-state startup", function()
         assert.True(adaptive.start())
     end)
 
+    it("does not mistake a sibling's concurrent first boot for legacy state", function()
+        local a, dict = new_worker()
+        local get = dict.get
+        local injected = false
+        dict.get = function(d, key, ...)
+            if key == a.st.K.sample_window and not injected then
+                -- sibling boots completely between our reads
+                injected = true
+                local v = get(d, key, ...)
+                local saved = { runtime.registry, runtime.order }
+                new_worker(nil, dict)
+                assert(adaptive.start())
+                runtime.registry, runtime.order = saved[1], saved[2]
+                runtime.started = false
+                return v
+            end
+            return get(d, key, ...)
+        end
+        assert(adaptive.start())
+        assert.are.equal(1, dict:get(a.st.K.sample_window))
+    end)
+
     it("refuses unmarked legacy state instead of guessing its window size", function()
         local old, dict = new_worker()
         assert(adaptive.start())
@@ -246,6 +268,28 @@ describe("probe failure handling", function()
                 { window = 32, sample_count = 100, completions = 100, mean_rtt = 0.02 }, l.cfg))
             assert.are.equal(100, restored.limit)
             assert.is_nil(restored.probe_restore)
+        end)
+
+        it(name .. " holds the probe on weak overload instead of dropping it", function()
+            local l = new_worker({ probe_interval = 30 })
+            local ns = assert(common.safe_update(algorithm,
+                { limit = 50, probe_restore = 100, long_rtt = 0.02, short_rtt = 0.02 },
+                { window = 32, sample_count = 2, completions = 3, timeout_count = 1,
+                  mean_rtt = 0.02 }, l.cfg))
+            assert.are.equal(50, ns.limit)
+            assert.are.equal(100, ns.probe_restore)
+        end)
+
+        it(name .. " restores a starved probe at the offset cap", function()
+            local l = new_worker({ probe_interval = 30 })
+            local state = { limit = 50, probe_restore = 100, long_rtt = 0.02, short_rtt = 0.02 }
+            for n = 31, 34 do
+                state = assert(common.safe_update(algorithm, state,
+                    { window = n, sample_count = 5, completions = 5, mean_rtt = 0.02 }, l.cfg))
+            end
+            assert.are.equal(100, state.limit)
+            assert.is_nil(state.probe_restore)
+            assert.are.equal(0.02, state.long_rtt)
         end)
     end
 end)

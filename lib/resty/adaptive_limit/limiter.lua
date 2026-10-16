@@ -303,11 +303,16 @@ function _M:check_schema()
         return nil, errors.INVALID_STATE
     end
 
-    -- per-limiter key existence (second+ limiters in a shared zone)
+    -- per-limiter key existence (second+ limiters in a shared zone).
+    -- limit and last_update are read BEFORE sample_window: a sibling adds
+    -- sample_window before seeding them and never deletes it, so state
+    -- seen here with sample_window still missing below is genuinely
+    -- legacy, not a sibling's concurrent first boot.
     local limit, lerr = dict:get(self.K_limit)
     if limit == nil and lerr and lerr ~= "not found" then
         return nil, errors.INTERNAL_ERROR, lerr
     end
+    local seeded = limit ~= nil or dict:get(st.K.last_update) ~= nil
     local sw, werr = dict:get(st.K.sample_window)
     if sw == nil then
         if werr and werr ~= "not found" then
@@ -315,7 +320,7 @@ function _M:check_schema()
         end
         -- Legacy state has no cadence marker; guessing would mix IDs
         -- from draining old workers with the new worker's windows.
-        if limit ~= nil or dict:get(st.K.last_update) ~= nil then
+        if seeded then
             return nil, errors.INVALID_STATE,
                 "shared state has no sample_window metadata; a full restart is required"
         end
@@ -330,8 +335,7 @@ function _M:check_schema()
             "sample_window changed from " .. tostring(sw) .. " to " ..
             tostring(self.cfg.sample_window) .. "; a full restart is required"
     end
-    if dict:get(st.K.inflight) == nil
-        and (limit ~= nil or dict:get(st.K.last_update) ~= nil) then
+    if seeded and dict:get(st.K.inflight) == nil then
         return nil, errors.INTERNAL_ERROR,
             "inflight counter missing; fully restart once traffic is quiesced"
     end
@@ -838,7 +842,7 @@ end
 -- Controller wiring (control path — called by the scheduler only)
 ------------------------------------------------------------------------
 
-local LEASE_TTL = 5      -- seconds; per-window lease outlives any tick
+local LEASE_TTL = 5      -- seconds; controller lease outlives any tick
 local HB_TTL = 5         -- seconds; worker heartbeat key lifetime
 -- At most this many closed windows are processed in one tick; older
 -- backlog (timer pause, SIGSTOP, laptop sleep) is skipped and counted.
@@ -924,15 +928,6 @@ end
 local function control_window(self, n, now, owner)
     local cfg = self.cfg
     local st = self.st
-
-    -- Controller lease: add wins. TTL-only expiry — we never delete a
-    -- lease, so a successor lease for a later window is never disturbed,
-    -- and last_window makes re-processing impossible anyway.
-    local ok = st:try_lease(n, owner, LEASE_TTL)
-    if not ok then
-        self.controller_skips = (self.controller_skips or 0) + 1
-        return false
-    end
 
     local acc, aerr = st:read_window(n)
     if not acc then
