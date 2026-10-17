@@ -299,9 +299,17 @@ function _M.probe_start(next_state, m, cfg, overloaded)
         and m.rejected_count > 0 and next_state.long_rtt ~= nil
         and _M.usable_rtt(m.mean_rtt) and _M.usable_rtt(next_state.short_rtt)
         and same_rtt(m.mean_rtt, next_state.short_rtt) then
+        -- Cut below capacity, not just below the limit: at saturation
+        -- Little's law puts capacity at limit * long_rtt / short_rtt. With
+        -- a baseline inflated k times (a cold start into a saturated
+        -- backend seeds it from a queued window) the probe still lands at
+        -- k * probe_fraction x capacity, reads a lower RTT and lowers the
+        -- baseline by probe_fraction; repeated probes converge to the
+        -- uncongested RTT instead of re-measuring the same queue.
+        local queue = math.min(1, next_state.long_rtt / next_state.short_rtt)
         next_state.probe_restore = next_state.limit
         next_state.limit = math.max(cfg.min_limit,
-            next_state.limit * cfg.probe_fraction)
+            next_state.limit * cfg.probe_fraction * queue)
     end
     return next_state
 end

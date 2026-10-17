@@ -33,8 +33,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # suite itself is the real test.
 RUN cpanm --notest Test::Nginx
 
-# busted for pure-Lua unit tests and simulations.
-RUN luarocks install busted 2>&1 | tail -2
+# LuaRocks built against OpenResty's own LuaJIT, pinned: some base images
+# ship none (bookworm) or one too old to resolve current rocks (bionic).
+# busted for pure-Lua unit tests and simulations; a failed install fails
+# the build instead of leaving an image without a test runner.
+ARG LUAROCKS_VERSION=3.13.0
+RUN curl -fsSL https://luarocks.org/releases/luarocks-${LUAROCKS_VERSION}.tar.gz \
+        | tar xz -C /tmp \
+    && cd /tmp/luarocks-${LUAROCKS_VERSION} \
+    && ./configure --prefix=/usr/local/openresty/luajit \
+        --with-lua=/usr/local/openresty/luajit \
+        --with-lua-include=/usr/local/openresty/luajit/include/luajit-2.1 \
+        --with-lua-interpreter=luajit \
+    && make && make install \
+    && cd / && rm -rf /tmp/luarocks-${LUAROCKS_VERSION} \
+    && /usr/local/openresty/luajit/bin/luarocks install busted
 
 # wrk for load generation (benchmarks + soak). Linked against OpenResty's
 # bundled LuaJIT — wrk's vendored LuaJIT/OpenSSL copies fail to build with

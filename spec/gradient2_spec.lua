@@ -103,18 +103,20 @@ describe("gradient2", function()
         local s1 = assert(common.safe_update(g2, state, m, cfg))
         assert.is_nil(s1.probe_restore)
         -- window 30: normal update (limit' = 50 + (100*0.9090.. + 10)*0.5
-        -- = 100.4545..), then published at half for the probe
+        -- = 100.4545..), then published for the probe at probe_fraction x
+        -- the Little's-law capacity estimate: 100.4545.. * 0.5 * (0.020 /
+        -- 0.044) = 22.8305..
         m.window = 30
         local s2 = assert(common.safe_update(g2, state, m, cfg))
         assert.True(near(s2.probe_restore, 100.45454545454545))
-        assert.True(near(s2.limit, 50.22727272727273))
+        assert.True(near(s2.limit, 22.830578512396694))
         -- window 31 is polluted by pre-probe admissions: held at the
         -- probe limit, nothing learned
         m.window = 31
         m.mean_rtt = 0.030
         local s3 = assert(common.safe_update(g2, state_of(s2), m, cfg))
         assert.True(s3.held)
-        assert.True(near(s3.limit, 50.22727272727273))
+        assert.True(near(s3.limit, 22.830578512396694))
         assert.True(near(s3.long_rtt, 0.020))
         assert.True(near(s3.short_rtt, 0.044))
         -- window 32 ran entirely at the probe limit and restores it.

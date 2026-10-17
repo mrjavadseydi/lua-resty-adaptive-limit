@@ -383,6 +383,29 @@ describe("simulation J: capacity drop just before a baseline probe", function()
     end
 end)
 
+describe("simulation K: cold start into an already saturated backend", function()
+    -- The first window already queues (limit 160, capacity 10), so the
+    -- baseline seeds from a queued RTT (8x the service time). A probe at
+    -- probe_fraction x limit stays above capacity and re-measures the
+    -- queue, pinning the limit at 34x capacity; probing at
+    -- probe_fraction x the Little's-law capacity estimate lowers the
+    -- baseline each probe until it reads the service time.
+    for _, alg in ipairs({ g2, aimd }) do
+        it(alg.name .. " recovers the true baseline", function()
+            local s = sim.new({ algorithm = alg, capacity = 10, demand = 1000,
+                initial_limit = 160, no_timeouts = true, curve = "little",
+                seed = 141 })
+            s:run(300)
+            for i = #s.history - 59, #s.history do
+                assert.True(s.history[i] <= 30,
+                    "window " .. i .. " limit " .. s.history[i] .. " at capacity 10")
+            end
+            assert.True(s.long_rtt < s.base * 1.2,
+                "baseline kept the cold-start queue: " .. s.long_rtt)
+        end)
+    end
+end)
+
 describe("simulation: AIMD comparison on scenario B", function()
     it("recovers too, using the same harness", function()
         local s = sim.new({ algorithm = aimd, capacity = 100, demand = 200,

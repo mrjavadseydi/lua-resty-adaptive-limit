@@ -17,6 +17,12 @@ All notable changes are documented here. Format based on
   straddles a capacity drop reads higher; neither is service time. Probes
   start only while latency is steady, so that reference does not lag a
   sudden change.
+- A cold start into an already saturated backend no longer pins a
+  queue-inflated baseline. Probes cut to `probe_fraction` x the
+  Little's-law capacity estimate (`limit * long_rtt / short_rtt`) instead
+  of `probe_fraction` x the limit, so an inflated baseline is lowered on
+  every probe until it reads the service time (simulation K: 34x capacity
+  before, near capacity after).
 - The library never evicts keys from its zone. Window accumulators were
   created with evicting writes, so an undersized zone dropped limiters'
   `inflight` counters (uncapped admission under `fail_open`) and

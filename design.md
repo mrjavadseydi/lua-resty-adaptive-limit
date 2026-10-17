@@ -370,10 +370,17 @@ Given window measurement `m` and current state:
    either queued RTT became the baseline, the gradient read 1 and headroom
    ratcheted the limit up (simulation J: 32x capacity). Refusing a genuine
    raise only shrinks the limit until a later probe, measured entirely in
-   the new regime, passes (simulation H). Known limit: a cold start into an
-   already saturated backend still seeds `long_rtt` from a queued first
-   window, and a probe can lower it only once `limit * probe_fraction`
-   falls below capacity. An overloaded probe cancels restoration and takes normal
+   the new regime, passes (simulation H). The cut itself targets capacity,
+   not the limit: `limit * probe_fraction * min(1, long_rtt / short_rtt)`,
+   since at saturation Little's law puts capacity at
+   `limit * long_rtt / short_rtt`. That matters when the baseline is
+   already too high: a cold start into a saturated backend seeds `long_rtt`
+   from a queued first window, and a cut to `limit * probe_fraction` stays
+   above capacity and re-measures the same queue (simulation K: 34x
+   capacity, permanently). Scaled by the estimate, a baseline inflated k
+   times probes at `k * probe_fraction` x capacity, reads a lower RTT and
+   is lowered by `probe_fraction` per probe until the probe runs
+   uncongested. An overloaded probe cancels restoration and takes normal
    overload handling at the reduced limit; overloaded windows never start
    a new probe.
    Phases derive from the shared window number, so any worker can run any
