@@ -1,8 +1,8 @@
 package = "lua-resty-adaptive-limit"
-version = "0.1.1-1"
+version = "0.2.0-1"
 source = {
     url = "git+https://github.com/mrjavadseydi/lua-resty-adaptive-limit.git",
-    tag = "v0.1.1",
+    tag = "v0.2.0",
 }
 
 description = {
@@ -18,7 +18,7 @@ operations (~0.22us per admission measured), one scheduler timer per
 worker, deterministic windows with lease-based single-leader controller
 updates, Gradient2 (default) and AIMD controllers, graceful-reload
 state preservation, worker-exit reconciliation, stuck-pool
-diagnostics, and no runtime dependencies beyond OpenResty >= 1.15.8.1
+diagnostics, and no runtime dependencies beyond OpenResty >= 1.19.3.1
 and the lua-resty-core it bundles.
 ]],
    homepage = "https://github.com/mrjavadseydi/lua-resty-adaptive-limit",

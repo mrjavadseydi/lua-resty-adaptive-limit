@@ -6,6 +6,8 @@ All notable changes are documented here. Format based on
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-17
+
 ### Fixed
 - Baseline probes no longer adopt a still-queued RTT. When the probe
   limit was itself above capacity, the probe re-seeded `long_rtt` with
@@ -122,6 +124,7 @@ schema change: upgrading with a graceful reload keeps the learned limit.
 - Named limiter lookup through `adaptive.get(name)` and local test selection
   through the `SPEC=`/`T=` Make variables.
 
-[Unreleased]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/releases/tag/v0.1.0

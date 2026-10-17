@@ -20,7 +20,7 @@ allow / reject            latency + outcome observations
 upstream
 ```
 
-Status: **0.1.1** — early release (see [CHANGELOG.md](CHANGELOG.md)), with
+Status: **0.2.0** — early release (see [CHANGELOG.md](CHANGELOG.md)), with
 multi-worker race tests, deterministic controller simulations, a
 real-traffic reload/SIGKILL harness, and published benchmarks. It is young
 software; read the failure behavior and limitations before deploying it.
