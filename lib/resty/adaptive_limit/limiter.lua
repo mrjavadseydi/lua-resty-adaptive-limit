@@ -112,13 +112,13 @@ end
 -- workers hold, and an unsynchronized set() while live requests move
 -- the counter would erase their admissions (design.md §9 — the same
 -- reason SIGKILL leaks are never auto-repaired). It is surfaced as an
--- internal error, governed by failure_mode, until an operator resets
--- the key (README: Failure behavior).
+-- internal error, governed by failure_mode, until traffic is quiesced and
+-- nginx fully restarted to clear pending local mirrors too (README).
 local function inflight_corrupted(self, where, detail)
     count_anomaly(self, "inflight_corrupted")
     rate_limited_log(self, "inflight_corrupted", ngx_ERR,
         "inflight counter corrupted (", detail, "); not repaired — ",
-        "reset the key once traffic is quiesced")
+        "fully restart nginx once traffic is quiesced")
     return internal_error(self, where, "inflight corrupted")
 end
 
@@ -469,9 +469,11 @@ function _M:try_acquire()
         rate_limited_log(self, "rollback", ngx_ERR,
             "rollback incr failed: ", rerr)
     elseif non_finite(rn) then
+        self.internal_errors = self.internal_errors + 1
         count_anomaly(self, "inflight_corrupted")
         rate_limited_log(self, "inflight_corrupted", ngx_ERR,
-            "inflight counter corrupted (non-finite) during rollback")
+            "inflight counter corrupted (non-finite) during rollback; ",
+            "not repaired — fully restart nginx once traffic is quiesced")
     elseif rn < 0 then
         repair_negative(self, rn, 1)
         count_anomaly(self, "negative_inflight")

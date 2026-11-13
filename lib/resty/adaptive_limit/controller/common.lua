@@ -250,14 +250,22 @@ end
 function _M.probe_step(state, m, cfg, overloaded)
     local restore = state.probe_restore
     local interval = cfg.probe_interval or 0
-    if restore == nil or interval <= 0 or m.window == nil then
+    if restore == nil then
         return nil
     end
-    -- Strong overload takes the normal backoff path at the reduced limit.
+    local long_rtt = _M.usable_rtt(state.long_rtt) and state.long_rtt or nil
+    -- Strong overload takes the normal backoff path at the reduced limit,
+    -- also when probing was just disabled (reload with a stranded probe).
     -- A weak one (too few completions to back off) must not: the normal
     -- path would hold without probe_restore and strand the reduced limit.
     if overloaded and (m.completions or m.sample_count)
         >= cfg.overload_min_samples then
+        return nil
+    end
+    if interval <= 0 then
+        return restore_probe(state, restore, long_rtt)
+    end
+    if m.window == nil then
         return nil
     end
     local offset = m.window % interval
@@ -266,7 +274,6 @@ function _M.probe_step(state, m, cfg, overloaded)
     if offset == 1 then
         return hold_probe(state, restore)
     end
-    local long_rtt = _M.usable_rtt(state.long_rtt) and state.long_rtt or nil
     -- offset 0 with a probe still open is a skipped cycle: restore,
     -- do not learn from whatever window happened to land there.
     if offset == 0 then

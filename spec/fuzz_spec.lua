@@ -86,11 +86,12 @@ local function run_trajectory(algorithm, seed, steps)
         local m, corrupt = gen_measurement(rand)
         local next_state, err = common.safe_update(algorithm, state, m, cfg)
 
-        if corrupt or next_state == nil then
+        if corrupt then
             -- rejected input must leave state untouched
             assert.falsy(next_state, "corrupt input produced state: "
                 .. tostring(err))
         else
+            assert.is_not_nil(next_state, "valid input rejected: " .. tostring(err))
             state = next_state
             local limit = state.limit
             assert.True(type(limit) == "number" and limit == limit,

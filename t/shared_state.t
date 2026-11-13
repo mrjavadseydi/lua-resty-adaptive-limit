@@ -228,3 +228,76 @@ start=nil no_memory=true
 started=false
 --- no_error_log
 [alert]
+
+=== TEST 6: corrupt inflight needs a full restart to discard stale worker mirrors
+--- http_config
+lua_package_path '/work/lib/?.lua;;';
+lua_shared_dict adaptive_limit 1m;
+init_worker_by_lua_block {
+    local adaptive = require("resty.adaptive_limit")
+    PAY = assert(adaptive.new({ name = "pay", shared_dict = "adaptive_limit",
+        initial_limit = 2, max_limit = 2, failure_mode = "fail_closed" }))
+    assert(adaptive.start({ flush_interval = 10 }))
+    function WAIT_FOR(key, count)
+        local d = ngx.shared.adaptive_limit
+        local t0 = ngx.now()
+        count = count or 1
+        while (d:get(key) or 0) < count and ngx.now() - t0 < 5 do
+            ngx.sleep(0.01)
+        end
+        assert((d:get(key) or 0) >= count, key)
+    end
+    ngx.timer.at(0.05, function(premature)
+        if premature then return end
+        local d = ngx.shared.adaptive_limit
+        assert(PAY:try_acquire())
+        d:incr("ready", 1, 0)
+        WAIT_FOR("corrupt")
+        local ok, err = PAY:release(0.02)
+        assert(not ok and err == "internal_error")
+        assert(PAY._inflight == 1)
+        d:incr("pending_mirrors", PAY._inflight, 0)
+        d:incr("released", 1, 0)
+        WAIT_FOR("reset")
+        if ngx.worker.id() == 0 then
+            WAIT_FOR("sibling_full")
+            assert(PAY:exit_worker())
+            d:set("worker_exited", 1)
+        else
+            assert(PAY:try_acquire())
+            assert(PAY:try_acquire())
+            d:set("sibling_full", 1)
+            WAIT_FOR("worker_exited")
+            d:set("overadmitted", PAY:try_acquire() and 1 or -1)
+        end
+    end)
+}
+--- config
+location /run {
+    content_by_lua_block {
+        local d = ngx.shared.adaptive_limit
+        WAIT_FOR("ready", 2)
+        d:set(PAY.K_inflight, "corrupt")
+        d:set("corrupt", 1)
+        WAIT_FOR("released", 2)
+        ngx.say("pending_mirrors=", d:get("pending_mirrors"))
+        ngx.say("counter_before_reset=", d:get(PAY.K_inflight))
+        -- Demonstrate why resetting only the shared key after quiescing is unsafe.
+        d:set(PAY.K_inflight, 0)
+        d:set("reset", 1)
+        WAIT_FOR("overadmitted")
+        ngx.say("unsafe_reset_overadmitted=", d:get("overadmitted") == 1)
+        ngx.say("counter=", d:get(PAY.K_inflight))
+    }
+}
+--- request
+GET /run
+--- response_body
+pending_mirrors=2
+counter_before_reset=corrupt
+unsafe_reset_overadmitted=true
+counter=2
+--- error_log
+fully restart nginx once traffic is quiesced
+--- no_error_log
+[alert]

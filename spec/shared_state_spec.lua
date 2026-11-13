@@ -240,6 +240,34 @@ end)
 describe("probe failure handling", function()
     for _, name in ipairs({ "gradient2", "aimd" }) do
         local algorithm = require("resty.adaptive_limit.controller." .. name)
+        it(name .. " restores an active probe when probing is disabled", function()
+            local l = new_worker({ probe_interval = 0 })
+            local state = { limit = 50, probe_restore = 100,
+                long_rtt = 0.02, short_rtt = 0.03 }
+            for _, m in ipairs({
+                { sample_count = 0, completions = 0 },
+                { window = 32, sample_count = 0, completions = 0 },
+                { window = 32, sample_count = 5, completions = 5, mean_rtt = 0.04 },
+            }) do
+                local ns = assert(common.safe_update(algorithm, state, m, l.cfg))
+                assert.are.equal(100, ns.limit)
+                assert.is_nil(ns.probe_restore)
+                assert.are.equal(0.02, ns.long_rtt)
+                assert.are.equal(0.03, ns.short_rtt)
+                assert.False(ns.held)
+            end
+        end)
+
+        it(name .. " backs off a strong overload even when probing is disabled", function()
+            local l = new_worker({ probe_interval = 0 })
+            local ns = assert(common.safe_update(algorithm,
+                { limit = 50, probe_restore = 100, long_rtt = 0.02, short_rtt = 0.02 },
+                { window = 32, sample_count = 0, completions = 100, timeout_count = 100 },
+                l.cfg))
+            assert.True(ns.limit < 50)
+            assert.is_nil(ns.probe_restore)
+        end)
+
         it(name .. " backs off timeout-only probes, including skipped cycles", function()
             local l = new_worker({ probe_interval = 30 })
             for _, n in ipairs({ 31, 32, 60 }) do

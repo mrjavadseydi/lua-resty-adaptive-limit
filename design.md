@@ -465,8 +465,9 @@ operations, executed by at most one worker, once per `sample_window`.
     reported as hung before the threshold has elapsed;
   - no automatic reset ever runs (an unsynchronized "repair" while live
     requests modify the counter would corrupt it). The README documents the
-    operator procedure: quiesce (or accept the shedding), then reset
-    `inflight` from an admin snippet. A *lost* `inflight` key is lost
+    operator procedure: quiesce (or accept the shedding), then fully stop
+    and start nginx; resetting only the `inflight` key is unsafe because
+    surviving workers may hold local mirrors. A *lost* `inflight` key is lost
     distributed state. The library itself never causes the loss: all its
     writes are non-evicting (`safe_add`/`safe_set`, `incr` without init),
     so a full zone fails the write that needed room rather than dropping a
