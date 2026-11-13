@@ -6,6 +6,23 @@ All notable changes are documented here. Format based on
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-11-13
+
+### Fixed
+- A probe left open when a reload disables probing (`probe_interval = 0`)
+  is now restored to its pre-probe limit; previously the reduced limit
+  was kept and the restore point discarded. A strong overload still
+  backs off at the reduced limit.
+- The rollback path's non-finite `inflight` error now counts as an
+  internal error and carries the restart guidance.
+
+### Changed
+- Recovery guidance for a corrupted or leaked `inflight` counter (README,
+  design.md, error log) is a full nginx stop/start with traffic
+  quiesced. Resetting only the shared key is unsafe: surviving workers
+  can hold local mirrors that a later worker exit subtracts from live
+  slots. The error-log text changed accordingly.
+
 ## [0.2.0] — 2026-10-17
 
 ### Fixed
@@ -124,7 +141,8 @@ schema change: upgrading with a graceful reload keeps the learned limit.
 - Named limiter lookup through `adaptive.get(name)` and local test selection
   through the `SPEC=`/`T=` Make variables.
 
-[Unreleased]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mrjavadseydi/lua-resty-adaptive-limit/releases/tag/v0.1.0

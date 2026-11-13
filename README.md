@@ -20,7 +20,7 @@ allow / reject            latency + outcome observations
 upstream
 ```
 
-Status: **0.2.0** — early release (see [CHANGELOG.md](CHANGELOG.md)), with
+Status: **0.2.1** — early release (see [CHANGELOG.md](CHANGELOG.md)), with
 multi-worker race tests, deterministic controller simulations, a
 real-traffic reload/SIGKILL harness, and published benchmarks. It is young
 software; read the failure behavior and limitations before deploying it.
@@ -375,9 +375,11 @@ operator `flush_all`, another module writing into a shared zone) follow
   library cannot know how many slots other workers hold, and an
   unsynchronized reset would erase their admissions. It is surfaced
   (`inflight_corrupted` anomaly, rate-limited error log) and treated as
-  an internal error under `failure_mode` until an operator resets the
-  key with traffic quiesced:
-  `ngx.shared.<zone>:set("al:1:<name>:inflight", 0)`.
+  an internal error under `failure_mode`. Quiesce traffic, then fully stop
+  and start nginx to clear both corrupted shared state and pending
+  worker-local mirrors; a graceful reload is insufficient. Do not reset
+  only the shared key, even after requests finish: failed releases leave
+  local holdings that a later worker exit would subtract from live slots.
   The limiter never crashes a request comparing against garbage.
 * **Startup write failures**: schema, window-size metadata, counter
   initialization, and adopted-limit writes are checked. `start()` returns
@@ -397,8 +399,10 @@ operator `flush_all`, another module writing into a shared zone) follow
   operator acts. An unsynchronized "repair" while live requests
   modify the counter would corrupt it. It is surfaced (heartbeat expiry,
   `controller_stalled`, inflight/throughput divergence) and the operator
-  procedure is: quiesce or accept the shedding, then reset `inflight` via
-  an admin snippet. A lease/quota backend that auto-recovers is a
+  procedure is: quiesce or accept the shedding, then fully stop and start
+  nginx. Do not reset only the `inflight` key from an admin snippet:
+  surviving workers may hold local mirrors that a later exit would
+  subtract from live slots. A lease/quota backend that auto-recovers is a
   separate feature and is not part of this release.
 * **Hung backend** (all in-flight requests stuck): a completion-based
   controller sees no samples, so the limit **holds** — backpressure
